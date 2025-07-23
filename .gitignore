@@ -1,0 +1,15 @@
+
+# Папки с данными сессий и ключами (Безопасность)
+/sessions_data/
+/active_keys_data/
+/user_data_archives/
+
+# Папка со скриншотами (Сгенерированные файлы)
+/screenshots_data/
+
+# Системные файлы Python (Лучшая практика)
+__pycache__/
+*.pyc
+
+
+.env
