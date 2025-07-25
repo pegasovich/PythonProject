@@ -634,7 +634,7 @@ async def perform_login_steps(page):
             
             print_timestamped(f"Авторизация через 'Дія.Підпис' успешно завершена. Текущий URL: {page.url}")
             await page.context.storage_state(path=CONFIG['storage_state_path'])
-            print_timestamped(f"Состояние сессии сохранено после авторизации в: {CONFIG['storage_state_path']}")
+            print_timestamped(f"Состояние сессии сохранено после успешной авторизации в: {CONFIG['storage_state_path']}")
             await send_telegram_message("Шаг 1.3 завершен: Успешная авторизация и сохранение сессии.", is_verbose=False)
 
         except Exception as e:
@@ -645,10 +645,11 @@ async def perform_login_steps(page):
     elif auth_method == 'idgov':
         await send_telegram_message("Шаг 1: Выбран метод ID.GOV.UA. Начинаю авторизацию.", is_verbose=True)
         try:
-            # Селектор для ID.GOV.UA может быть менее стабильным, используем get_by_role если возможно
-            id_gov_ua_button = page.get_by_role("button", name="ID.GOV.UA")
+            # --- ИЗМЕНЕНИЕ 3: Возвращаемся к рабочему селектору по индексу ---
+            id_gov_ua_button = page.locator('button').nth(2)
             await id_gov_ua_button.wait_for(state='visible', timeout=20000)
             await id_gov_ua_button.click(timeout=30000)
+            # --- КОНЕЦ ИЗМЕНЕНИЯ 3 ---
             await page.wait_for_load_state('networkidle', timeout=CONFIG['timeout'])
             print_timestamped(f"Страница загружена после клика. Текущий URL: {page.url}")
             await send_telegram_message("Шаг 1 завершен: Переход на ID.GOV.UA.", is_verbose=True)
