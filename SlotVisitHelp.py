@@ -530,8 +530,9 @@ async def perform_login_steps(page):
         # +++ ИЗМЕНЕНИЕ: Добавлена кнопка "Дія.Підпис" +++
         keyboard = [
             [InlineKeyboardButton("Дія.Підпис", callback_data='diia')], # Новая кнопка
-            [InlineKeyboardButton("ID.GOV.UA (BankID)", callback_data='idgov')],
             [InlineKeyboardButton("Особистий ключ", callback_data='key')],
+            [InlineKeyboardButton("ID.GOV.UA (BankID)", callback_data='idgov')],
+            
         ]
         # --- КОНЕЦ ИЗМЕНЕНИЯ ---
         reply_markup = InlineKeyboardMarkup(keyboard)
