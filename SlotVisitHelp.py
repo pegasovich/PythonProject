@@ -527,10 +527,13 @@ async def perform_login_steps(page):
         # --- ШАГ 1А: Запрос выбора метода авторизации в Telegram ---
         print_timestamped("Шаг 1: Запрос метода авторизации у пользователя в Telegram...")
 
+        # +++ ИЗМЕНЕНИЕ: Добавлена кнопка "Дія.Підпис" +++
         keyboard = [
-            [InlineKeyboardButton("ID.GOV.UA", callback_data='idgov')],
+            [InlineKeyboardButton("Дія.Підпис", callback_data='diia')], # Новая кнопка
+            [InlineKeyboardButton("ID.GOV.UA (BankID)", callback_data='idgov')],
             [InlineKeyboardButton("Особистий ключ", callback_data='key')],
         ]
+        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
         reply_markup = InlineKeyboardMarkup(keyboard)
 
         try:
@@ -582,10 +585,68 @@ async def perform_login_steps(page):
         USER_DATA['auth_method'] = auth_method
 
     # --- ШАГ 1Б: Выполнение действия в зависимости от выбора ---
-    if auth_method == 'idgov':
+
+    # +++ НОВЫЙ БЛОК: Логика для авторизации через "Дія.Підпис" +++
+    if auth_method == 'diia':
+        await send_telegram_message("Шаг 1: Выбран метод 'Дія.Підпис'. Начинаю авторизацию.", is_verbose=True)
+        try:
+            # ШАГ 1.1: Клик по кнопке "Дія.Підпис"
+            diia_button_selector = 'button:has-text("Дія.Підпис")'
+            await page.locator(diia_button_selector).wait_for(state='visible', timeout=20000)
+            print_timestamped("Нажимаю кнопку 'Дія.Підпис'...")
+            
+            # --- ИЗМЕНЕНИЕ: Просто кликаем, так как QR-код загружается на этой же странице ---
+            await page.locator(diia_button_selector).click(timeout=30000)
+            
+            # Ждем, пока страница перейдет в состояние покоя после подгрузки QR-кода
+            print_timestamped("Ожидаю загрузки QR-кода на текущей странице...")
+            await page.wait_for_load_state('networkidle', timeout=CONFIG['timeout'])
+            print_timestamped(f"Страница с QR-кодом 'Дія' загружена. URL: {page.url}")
+            await send_telegram_message("Шаг 1.1 завершен: Переход на страницу с QR-кодом.", is_verbose=True)
+
+            # ШАГ 1.2: Сделать и выслать скриншот QR-кода
+            print_timestamped("Шаг 1.2: Поиск и захват QR-кода 'Дія'...")
+            await page.wait_for_timeout(3000) # Даем время на отрисовку
+            
+            qr_element = page.locator("canvas, div.qr-code, #qr-overlay").first
+            await qr_element.wait_for(state='visible', timeout=60000)
+            print_timestamped("Элемент QR-кода найден и видим.")
+            
+            await qr_element.scroll_into_view_if_needed()
+            await page.wait_for_timeout(1000)
+
+            qr_path = await save_screenshot(page, "diia_qr_code_capture", locator=qr_element, timeout=CONFIG['timeout'])
+            
+            if qr_path:
+                await send_telegram_photo(qr_path, "Відскануйте QR-код у застосунку 'Дія' для авторизації.")
+                await send_telegram_message("QR-код для 'Дія' отправлен. Ожидаю подтверждения в приложении...", is_verbose=False)
+            else:
+                error_msg = "Не удалось создать скриншот QR-кода для 'Дія.Підпис'."
+                print_timestamped(error_msg)
+                await send_telegram_message(error_msg, is_verbose=False)
+                raise Exception(error_msg)
+            
+            # ШАГ 1.3: Ожидание завершения авторизации и редиректа
+            print_timestamped("Ожидание завершения авторизации через 'Дія'...")
+            # После сканирования Дія вернет нас обратно на e-consul
+            await page.wait_for_url("**/e-consul.gov.ua/**", timeout=CONFIG['timeout'])
+            await page.wait_for_load_state('networkidle', timeout=CONFIG['timeout'])
+            
+            print_timestamped(f"Авторизация через 'Дія.Підпис' успешно завершена. Текущий URL: {page.url}")
+            await page.context.storage_state(path=CONFIG['storage_state_path'])
+            print_timestamped(f"Состояние сессии сохранено после авторизации в: {CONFIG['storage_state_path']}")
+            await send_telegram_message("Шаг 1.3 завершен: Успешная авторизация и сохранение сессии.", is_verbose=False)
+
+        except Exception as e:
+            await send_telegram_message(f"Критическая ошибка на Шаге 1 ('Дія.Підпис'): {e}", is_verbose=False)
+            raise Exception(f"Ошибка на Шаге 1 ('Дія.Підпис'): {e}")
+    # --- КОНЕЦ НОВОГО БЛОКА ---
+            
+    elif auth_method == 'idgov':
         await send_telegram_message("Шаг 1: Выбран метод ID.GOV.UA. Начинаю авторизацию.", is_verbose=True)
         try:
-            id_gov_ua_button = page.locator('button').nth(2)
+            # Селектор для ID.GOV.UA может быть менее стабильным, используем get_by_role если возможно
+            id_gov_ua_button = page.get_by_role("button", name="ID.GOV.UA")
             await id_gov_ua_button.wait_for(state='visible', timeout=20000)
             await id_gov_ua_button.click(timeout=30000)
             await page.wait_for_load_state('networkidle', timeout=CONFIG['timeout'])
@@ -597,61 +658,44 @@ async def perform_login_steps(page):
     elif auth_method == 'key':
         await send_telegram_message("Шаг 1: Выбран метод 'Особистий ключ'. Начинаю авторизацию.", is_verbose=True)
         last_update_id = 0
-
-        # --- ИЗМЕНЕНИЕ: Проверяем, можно ли использовать сохраненные данные для входа ---
         saved_key_path = USER_DATA.get('key_file_path')
         saved_password = USER_DATA.get('key_password')
         saved_knedp = USER_DATA.get('knedp_choice')
-        
         needs_user_input = not (saved_key_path and os.path.exists(saved_key_path) and saved_password and saved_knedp)
 
-        # --- БЛОК 1: АВТОМАТИЧЕСКИЙ ВХОД С СОХРАНЕННЫМИ ДАННЫМИ ---
         if not needs_user_input:
             print_timestamped("Найдены сохраненные данные для авторизации по ключу. Попытка автоматического входа.")
             await send_telegram_message("Использую сохраненные данные ключа и пароль для входа.", is_verbose=False)
             try:
-                # 1. Кликаем по "Особистий Ключ"
-                personal_key_button = page.locator('button').nth(1)
+                personal_key_button = page.get_by_role("button", name="Особистий ключ")
                 await personal_key_button.wait_for(state='visible', timeout=20000)
                 await personal_key_button.click(timeout=30000)
                 await page.wait_for_load_state('networkidle', timeout=CONFIG['timeout'])
-
-                # 2. Проверяем, что открылось окно "Увійдіть за допомогою особистого ключа"
                 login_title_selector = 'h4#id-app-login-title:has-text("Увійдіть за допомогою особистого ключа")'
                 await page.locator(login_title_selector).wait_for(state='visible', timeout=20000)
-
-                # 3. Загружаем файл ключа
                 async with page.expect_file_chooser() as fc_info:
                     await page.locator('text="Оберіть ключ на своєму носієві"').click()
                 file_chooser = await fc_info.value
                 await file_chooser.set_files(saved_key_path)
                 print_timestamped(f"Использую сохраненный файл ключа: {saved_key_path}")
-
-                # 4. Выбираем КНЕДП
                 if saved_knedp == 'knedp_mono':
                     await page.locator('#id-app-login-sign-form-file-key-server').click(timeout=10000)
                     await page.locator('li[data-value="31"]').click(timeout=10000)
                     print_timestamped("Использую сохраненный КНЕДП: monobank")
                 else:
                     raise NotImplementedError(f"Сохраненный КНЕДП '{saved_knedp}' не поддерживается для автоматического входа.")
-                
-                # 5. Вводим пароль
                 password_input_selector = 'input#id-app-login-sign-form-file-key-password'
                 await page.locator(password_input_selector).fill(saved_password, timeout=10000)
                 print_timestamped("Использую сохраненный пароль.")
-
-                # 6. Кликаем "Продовжити"
                 continue_button_selector = 'button#id-app-login-sign-form-file-key-sign-button'
                 await page.locator(continue_button_selector).wait_for(state='visible', timeout=10000)
                 async with page.expect_navigation(url="**/e-consul.gov.ua/**", timeout=CONFIG['timeout']):
                     await page.locator(continue_button_selector).click(timeout=20000)
-
                 await page.wait_for_load_state('networkidle', timeout=CONFIG['timeout'])
                 print_timestamped(f"Авторизация через сохраненный личный ключ успешно завершена. URL: {page.url}")
                 await page.context.storage_state(path=CONFIG['storage_state_path'])
                 print_timestamped(f"Состояние сессии сохранено после успешной авторизации в: {CONFIG['storage_state_path']}")
                 await send_telegram_message("Успешная автоматическая авторизация через сохраненный 'Особистий ключ'.", is_verbose=False)
-
             except Exception as e:
                 print_timestamped(f"Автоматический вход с сохраненными данными не удался: {e}. Запрашиваю данные у пользователя.")
                 await send_telegram_message(f"Авто-вход по ключу не удался. Возможно, пароль изменился. Запрашиваю данные заново.", is_verbose=False)
@@ -664,28 +708,20 @@ async def perform_login_steps(page):
                 await page.reload(timeout=CONFIG['timeout'])
                 await page.wait_for_load_state('networkidle', timeout=CONFIG['timeout'])
         
-        # --- БЛОК 2: ЗАПРОС ДАННЫХ У ПОЛЬЗОВАТЕЛЯ И ВХОД ---
         if needs_user_input:
             print_timestamped("Требуется ввод данных от пользователя для авторизации по ключу.")
             try:
-                # 1. Кликаем по "Особистий Ключ", если окно еще не открыто
                 if not await page.locator('h4#id-app-login-title:has-text("Увійдіть за допомогою особистого ключа")').is_visible():
-                    personal_key_button = page.locator('button').nth(1)
+                    personal_key_button = page.get_by_role("button", name="Особистий ключ")
                     await personal_key_button.wait_for(state='visible', timeout=20000)
                     await personal_key_button.click(timeout=30000)
                     await page.wait_for_load_state('networkidle', timeout=CONFIG['timeout'])
-                
                 print_timestamped("Переход на страницу авторизации через 'Особистий ключ' выполнен.")
-
-                # 2. Проверяем, что открылось окно
                 login_title_selector = 'h4#id-app-login-title:has-text("Увійдіть за допомогою особистого ключа")'
                 await page.locator(login_title_selector).wait_for(state='visible', timeout=20000)
                 print_timestamped("Окно 'Увійдіть за допомогою особистого ключа' подтверждено.")
-
-                # 3. Просим прикрепить файл с ключем
                 await bot.send_message(chat_id=CONFIG['telegram_chat_id'], text="Прикріпіть файл з ключем.\nПідтримуються формати: .jks, .pfx, .pk8, .zs2, .dat")
                 print_timestamped("Запрос на файл ключа отправлен в Telegram. Ожидание файла (таймаут 3 минуты)...")
-
                 document = None
                 for _ in range(180):
                     updates = await bot.get_updates(offset=last_update_id, timeout=1)
@@ -697,33 +733,26 @@ async def perform_login_steps(page):
                     if document:
                         break
                     await asyncio.sleep(1)
-
                 if not document:
                     raise Exception("Файл с ключем не был получен от пользователя в течение 3 минут.")
-
                 file_id = document.file_id
                 file_name = document.file_name
                 tg_file = await bot.get_file(file_id)
-
                 key_storage_dir = os.path.join(CONFIG['base_keys_dir'], CONFIG['process_id'])
                 os.makedirs(key_storage_dir, exist_ok=True)
                 key_file_path = os.path.join(key_storage_dir, file_name)
                 await tg_file.download_to_drive(key_file_path)
                 print_timestamped(f"Файл ключа '{file_name}' получен и сохранен в: {key_file_path}")
                 await send_telegram_message(f"Файл '{file_name}' получен. Загружаю...", is_verbose=True)
-
                 async with page.expect_file_chooser() as fc_info:
                     await page.locator('text="Оберіть ключ на своєму носієві"').click()
                 file_chooser = await fc_info.value
                 await file_chooser.set_files(key_file_path)
                 print_timestamped("Файл ключа успешно выбран в диалоге.")
-
-                # 4. Предлагаем выбрать КНЕДП
                 knedp_keyboard = [[InlineKeyboardButton('КНЕДП АЦСК АТ КБ "ПРИВАТБАНК"', callback_data='knedp_privat')], [InlineKeyboardButton("КНЕДП monobank | Universal Bank", callback_data='knedp_mono')]]
                 knedp_reply_markup = InlineKeyboardMarkup(knedp_keyboard)
                 knedp_message = await bot.send_message(chat_id=CONFIG['telegram_chat_id'], text="Виберіть Кваліфікованого надавача електронних довірчих послуг:", reply_markup=knedp_reply_markup)
                 print_timestamped("Запрос на выбор КНЕДП отправлен. Ожидание выбора (таймаут 3 минуты)...")
-
                 knedp_choice = None
                 for _ in range(180):
                     updates = await bot.get_updates(offset=last_update_id, timeout=1)
@@ -739,10 +768,8 @@ async def perform_login_steps(page):
                     if knedp_choice:
                         break
                     await asyncio.sleep(1)
-
                 if not knedp_choice:
                     raise Exception("Пользователь не выбрал КНЕДП в течение 3 минут.")
-                
                 if knedp_choice == 'knedp_privat':
                     raise NotImplementedError("Логика для 'ПриватБанк' еще не реализована.")
                 elif knedp_choice == 'knedp_mono':
@@ -750,34 +777,25 @@ async def perform_login_steps(page):
                     await page.locator('li[data-value="31"]').click(timeout=10000)
                     print_timestamped("'КНЕДП monobank' успешно выбран.")
                     await send_telegram_message("'КНЕДP monobank' выбран.", is_verbose=True)
-
-                # 5. Запрос пароля
                 password, last_update_id = await request_telegram_text("Введіть пароль ключа", last_update_id)
                 if not password:
                     raise Exception("Пароль не был получен от пользователя в течение 3 минут.")
-
-                # Сохранение новых данных для последующих запусков
                 USER_DATA['key_file_name'] = file_name
                 USER_DATA['key_file_path'] = key_file_path
                 USER_DATA['knedp_choice'] = knedp_choice
                 USER_DATA['key_password'] = password
                 print_timestamped("Новые данные ключа и пароль сохранены для последующей архивации.")
-
                 await page.locator('input#id-app-login-sign-form-file-key-password').fill(password, timeout=10000)
                 print_timestamped("Пароль введен на странице.")
-
-                # 6. Кликаем "Продовжити"
                 continue_button_selector = 'button#id-app-login-sign-form-file-key-sign-button'
                 await page.locator(continue_button_selector).wait_for(state='visible', timeout=10000)
                 async with page.expect_navigation(url="**/e-consul.gov.ua/**", timeout=CONFIG['timeout']):
                     await page.locator(continue_button_selector).click(timeout=20000)
-
                 await page.wait_for_load_state('networkidle', timeout=CONFIG['timeout'])
                 print_timestamped(f"Авторизация через личный ключ успешно завершена, перешли на e-consul.gov.ua. URL: {page.url}")
                 await page.context.storage_state(path=CONFIG['storage_state_path'])
                 print_timestamped(f"Состояние сессии сохранено после успешной авторизации в: {CONFIG['storage_state_path']}")
                 await send_telegram_message("Успешная авторизация через 'Особистий ключ' и сохранение сессии.", is_verbose=False)
-
             except Exception as e:
                 await send_telegram_message(f"Критическая ошибка на Шаге 1 (Особистий ключ): {e}", is_verbose=False)
                 raise Exception(f"Ошибка на Шаге 1 (Особистий ключ): {e}")
@@ -808,15 +826,12 @@ async def perform_login_steps(page):
             bank_select_button_selector = '#selBankConnect-button'
             monobank_list_item_selector = '#ui-id-4'
             continue_button_selector = '#btnBankIDChoose'
-
             await page.locator(bank_select_button_selector).wait_for(state='visible', timeout=20000)
             await page.locator(bank_select_button_selector).click(timeout=20000)
             print_timestamped("Кликнули по полю 'Оберіть банк'.")
-
             await page.locator(monobank_list_item_selector).wait_for(state='visible', timeout=10000)
             await page.locator(monobank_list_item_selector).click(timeout=10000)
             print_timestamped("Выбран 'monobank'.")
-
             await page.locator(continue_button_selector).wait_for(state='visible', timeout=10000)
             async with page.expect_navigation(url="**/api.monobank.ua/**", timeout=CONFIG['timeout']):
                 await page.locator(continue_button_selector).click(timeout=10000)
@@ -841,9 +856,7 @@ async def perform_login_steps(page):
             print_timestamped("Элемент QR-кода найден и видим.")
             await qr_element.scroll_into_view_if_needed()
             await page.wait_for_timeout(1000)
-
             qr_path = await save_screenshot(page, "qr_code_capture", locator=qr_element, timeout=CONFIG['timeout'])
-
             print_timestamped(f"Скриншот QR-кода сохранен: {qr_path}")
             await send_telegram_photo(qr_path, f"QR-код получен!")
             await send_telegram_message("QR-код получен и отправлен в Telegram. Ожидаю авторизации...", is_verbose=False)
