@@ -483,32 +483,44 @@ async def request_telegram_text(prompt_text, last_update_id, timeout_seconds=180
     print_timestamped(f"Запрос отправлен: '{prompt_text}'. Ожидание ответа ({timeout_seconds}с)...")
 
     response_text = None
+    # <<< НАЧАЛО ИЗМЕНЕНИЙ: Усиленная защита от сбоев Telegram >>>
     for _ in range(timeout_seconds):
-        updates = await bot.get_updates(offset=last_update_id, timeout=1)
-        for update in updates:
-            last_update_id = max(last_update_id, update.update_id + 1)
-            if update.message and update.message.text:
-                response_text = update.message.text
-                try: # Попытка удалить сообщение с данными для конфиденциальности
-                    await bot.delete_message(chat_id=update.message.chat.id, message_id=update.message.message_id)
-                except Exception:
-                    pass # Игнорируем ошибку, если не удалось удалить
+        try:
+            updates = await bot.get_updates(offset=last_update_id, timeout=1)
+            for update in updates:
+                last_update_id = max(last_update_id, update.update_id + 1)
+                if update.message and update.message.text:
+                    response_text = update.message.text
+                    try: 
+                        await bot.delete_message(chat_id=update.message.chat.id, message_id=update.message.message_id)
+                    except Exception:
+                        pass 
+                    break
+            if response_text:
                 break
-        if response_text:
-            break
+        except TelegramError as e:
+            if "Timed out" in str(e):
+                print_timestamped("Предупреждение: Таймаут при связи с Telegram. Повторяю попытку...")
+                await asyncio.sleep(2)
+                continue
+            else:
+                print_timestamped(f"Критическая ошибка Telegram в request_telegram_text: {e}")
+                raise e # Передаем дальше другие ошибки
+        
         await asyncio.sleep(1)
+    # <<< КОНЕЦ ИЗМЕНЕНИЙ >>>
 
     if not response_text:
         print_timestamped("Пользователь не предоставил текстовый ответ в течение таймаута.")
-        # Отправляем сообщение об ошибке в Telegram
         await bot.send_message(
             chat_id=CONFIG['telegram_chat_id'],
             text=f"Час очікування на введення тексту '{prompt_text}' вичерпано."
         )
         return None, last_update_id
 
-    print_timestamped(f"Получен ответ.") # Не логируем сам ответ для конфиденциальности
+    print_timestamped(f"Получен ответ.") 
     return response_text, last_update_id
+
 
 async def perform_login_steps(page):
     """
@@ -517,24 +529,18 @@ async def perform_login_steps(page):
     """
     global USER_DATA
 
-    # ИЗМЕНЕНИЕ: Проверяем, есть ли сохраненный метод авторизации
     auth_method = USER_DATA.get('auth_method')
 
     if auth_method:
         print_timestamped(f"Использую сохраненный метод авторизации: {auth_method.upper()}")
         await send_telegram_message(f"Используется сохраненный метод авторизации: {auth_method.upper()}", is_verbose=True)
     else:
-        # --- ШАГ 1А: Запрос выбора метода авторизации в Telegram ---
         print_timestamped("Шаг 1: Запрос метода авторизации у пользователя в Telegram...")
-
-        # +++ ИЗМЕНЕНИЕ: Добавлена кнопка "Дія.Підпис" +++
         keyboard = [
-            [InlineKeyboardButton("Дія.Підпис", callback_data='diia')], # Новая кнопка
+            [InlineKeyboardButton("Дія.Підпис", callback_data='diia')],
             [InlineKeyboardButton("Особистий ключ", callback_data='key')],
             [InlineKeyboardButton("ID.GOV.UA (BankID)", callback_data='idgov')],
-
         ]
-        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
         reply_markup = InlineKeyboardMarkup(keyboard)
 
         try:
@@ -548,8 +554,8 @@ async def perform_login_steps(page):
             raise Exception(f"Не удалось отправить сообщение с выбором в Telegram: {e}")
 
         last_update_id = 0
-        # Ожидание ответа пользователя в течение 3 минут
-        for _ in range(180):  # 180 попыток с секундным интервалом
+        # <<< НАЧАЛО ИЗМЕНЕНИЙ: Усиленная защита от сбоев Telegram >>>
+        for _ in range(180):
             try:
                 updates = await bot.get_updates(offset=last_update_id, timeout=1)
                 for update in updates:
@@ -557,7 +563,7 @@ async def perform_login_steps(page):
                     if update.callback_query and update.callback_query.message.message_id == message.message_id:
                         query = update.callback_query
                         auth_method = query.data
-                        await query.answer()  # Подтверждение нажатия кнопки
+                        await query.answer()
                         await bot.edit_message_text(
                             chat_id=query.message.chat.id,
                             message_id=query.message.message_id,
@@ -566,10 +572,18 @@ async def perform_login_steps(page):
                         print_timestamped(f"Пользователь выбрал: {auth_method}")
                         break
                 if auth_method:
-                    break  # Выход из цикла ожидания
-            except Exception as e:
-                print_timestamped(f"Ошибка при получении обновлений от Telegram: {e}")
-                await asyncio.sleep(5) # Пауза в случае ошибки сети
+                    break
+            except TelegramError as e:
+                if "Timed out" in str(e):
+                    print_timestamped("Предупреждение: Таймаут при связи с Telegram. Повторяю попытку...")
+                    await asyncio.sleep(2)
+                    continue
+                else:
+                    print_timestamped(f"Критическая ошибка Telegram в perform_login_steps (выбор метода): {e}")
+                    raise e
+            
+            await asyncio.sleep(1)
+        # <<< КОНЕЦ ИЗМЕНЕНИЙ >>>
 
         if not auth_method:
             try:
@@ -581,43 +595,28 @@ async def perform_login_steps(page):
             except Exception as e:
                 print_timestamped(f"Не удалось обновить сообщение о тайм-ауте в Telegram: {e}")
             raise Exception("Пользователь не выбрал метод авторизации в течение 3 минут.")
-
-        # Сохраняем выбор пользователя
+        
         USER_DATA['auth_method'] = auth_method
 
-    # --- ШАГ 1Б: Выполнение действия в зависимости от выбора ---
-
-    # +++ НОВЫЙ БЛОК: Логика для авторизации через "Дія.Підпис" +++
     if auth_method == 'diia':
         await send_telegram_message("Шаг 1: Выбран метод 'Дія.Підпис'. Начинаю авторизацию.", is_verbose=True)
         try:
-            # ШАГ 1.1: Клик по кнопке "Дія.Підпис"
             diia_button_selector = 'button:has-text("Дія.Підпис")'
             await page.locator(diia_button_selector).wait_for(state='visible', timeout=20000)
             print_timestamped("Нажимаю кнопку 'Дія.Підпис'...")
-
-            # --- ИЗМЕНЕНИЕ: Просто кликаем, так как QR-код загружается на этой же странице ---
             await page.locator(diia_button_selector).click(timeout=30000)
-
-            # Ждем, пока страница перейдет в состояние покоя после подгрузки QR-кода
             print_timestamped("Ожидаю загрузки QR-кода на текущей странице...")
             await page.wait_for_load_state('networkidle', timeout=CONFIG['timeout'])
             print_timestamped(f"Страница с QR-кодом 'Дія' загружена. URL: {page.url}")
             await send_telegram_message("Шаг 1.1 завершен: Переход на страницу с QR-кодом.", is_verbose=True)
-
-            # ШАГ 1.2: Сделать и выслать скриншот QR-кода
             print_timestamped("Шаг 1.2: Поиск и захват QR-кода 'Дія'...")
-            await page.wait_for_timeout(3000) # Даем время на отрисовку
-
+            await page.wait_for_timeout(3000)
             qr_element = page.locator("canvas, div.qr-code, #qr-overlay").first
             await qr_element.wait_for(state='visible', timeout=60000)
             print_timestamped("Элемент QR-кода найден и видим.")
-
             await qr_element.scroll_into_view_if_needed()
             await page.wait_for_timeout(1000)
-
             qr_path = await save_screenshot(page, "diia_qr_code_capture", locator=qr_element, timeout=CONFIG['timeout'])
-
             if qr_path:
                 await send_telegram_photo(qr_path, "Відскануйте QR-код у застосунку 'Дія' для авторизації.")
                 await send_telegram_message("QR-код для 'Дія' отправлен. Ожидаю подтверждения в приложении...", is_verbose=False)
@@ -626,31 +625,23 @@ async def perform_login_steps(page):
                 print_timestamped(error_msg)
                 await send_telegram_message(error_msg, is_verbose=False)
                 raise Exception(error_msg)
-
-            # ШАГ 1.3: Ожидание завершения авторизации и редиректа
             print_timestamped("Ожидание завершения авторизации через 'Дія'...")
-            # После сканирования Дія вернет нас обратно на e-consul
             await page.wait_for_url("**/e-consul.gov.ua/**", timeout=CONFIG['timeout'])
             await page.wait_for_load_state('networkidle', timeout=CONFIG['timeout'])
-
             print_timestamped(f"Авторизация через 'Дія.Підпис' успешно завершена. Текущий URL: {page.url}")
             await page.context.storage_state(path=CONFIG['storage_state_path'])
             print_timestamped(f"Состояние сессии сохранено после успешной авторизации в: {CONFIG['storage_state_path']}")
             await send_telegram_message("Шаг 1.3 завершен: Успешная авторизация и сохранение сессии.", is_verbose=False)
-
         except Exception as e:
             await send_telegram_message(f"Критическая ошибка на Шаге 1 ('Дія.Підпис'): {e}", is_verbose=False)
             raise Exception(f"Ошибка на Шаге 1 ('Дія.Підпис'): {e}")
-    # --- КОНЕЦ НОВОГО БЛОКА ---
 
     elif auth_method == 'idgov':
         await send_telegram_message("Шаг 1: Выбран метод ID.GOV.UA. Начинаю авторизацию.", is_verbose=True)
         try:
-            # --- ИЗМЕНЕНИЕ 3: Возвращаемся к рабочему селектору по индексу ---
             id_gov_ua_button = page.locator('button').nth(2)
             await id_gov_ua_button.wait_for(state='visible', timeout=20000)
             await id_gov_ua_button.click(timeout=30000)
-            # --- КОНЕЦ ИЗМЕНЕНИЯ 3 ---
             await page.wait_for_load_state('networkidle', timeout=CONFIG['timeout'])
             print_timestamped(f"Страница загружена после клика. Текущий URL: {page.url}")
             await send_telegram_message("Шаг 1 завершен: Переход на ID.GOV.UA.", is_verbose=True)
@@ -725,18 +716,31 @@ async def perform_login_steps(page):
                 await bot.send_message(chat_id=CONFIG['telegram_chat_id'], text="Прикріпіть файл з ключем.\nПідтримуються формати: .jks, .pfx, .pk8, .zs2, .dat")
                 print_timestamped("Запрос на файл ключа отправлен в Telegram. Ожидание файла (таймаут 3 минуты)...")
                 document = None
+                
+                # <<< НАЧАЛО ИЗМЕНЕНИЙ: Усиленная защита от сбоев Telegram >>>
                 for _ in range(180):
-                    updates = await bot.get_updates(offset=last_update_id, timeout=1)
-                    for update in updates:
-                        last_update_id = max(last_update_id, update.update_id + 1)
-                        if update.message and update.message.document:
-                            document = update.message.document
+                    try:
+                        updates = await bot.get_updates(offset=last_update_id, timeout=1)
+                        for update in updates:
+                            last_update_id = max(last_update_id, update.update_id + 1)
+                            if update.message and update.message.document:
+                                document = update.message.document
+                                break
+                        if document:
                             break
-                    if document:
-                        break
+                    except TelegramError as e:
+                        if "Timed out" in str(e):
+                            print_timestamped("Предупреждение: Таймаут при связи с Telegram. Повторяю попытку...")
+                            await asyncio.sleep(2)
+                            continue
+                        else:
+                            raise e
                     await asyncio.sleep(1)
+                # <<< КОНЕЦ ИЗМЕНЕНИЙ >>>
+
                 if not document:
                     raise Exception("Файл с ключем не был получен от пользователя в течение 3 минут.")
+                
                 file_id = document.file_id
                 file_name = document.file_name
                 tg_file = await bot.get_file(file_id)
@@ -751,27 +755,41 @@ async def perform_login_steps(page):
                 file_chooser = await fc_info.value
                 await file_chooser.set_files(key_file_path)
                 print_timestamped("Файл ключа успешно выбран в диалоге.")
+                
                 knedp_keyboard = [[InlineKeyboardButton('КНЕДП АЦСК АТ КБ "ПРИВАТБАНК"', callback_data='knedp_privat')], [InlineKeyboardButton("КНЕДП monobank | Universal Bank", callback_data='knedp_mono')]]
                 knedp_reply_markup = InlineKeyboardMarkup(knedp_keyboard)
                 knedp_message = await bot.send_message(chat_id=CONFIG['telegram_chat_id'], text="Виберіть Кваліфікованого надавача електронних довірчих послуг:", reply_markup=knedp_reply_markup)
                 print_timestamped("Запрос на выбор КНЕДП отправлен. Ожидание выбора (таймаут 3 минуты)...")
+                
                 knedp_choice = None
+                # <<< НАЧАЛО ИЗМЕНЕНИЙ: Усиленная защита от сбоев Telegram >>>
                 for _ in range(180):
-                    updates = await bot.get_updates(offset=last_update_id, timeout=1)
-                    for update in updates:
-                        last_update_id = max(last_update_id, update.update_id + 1)
-                        if update.callback_query and update.callback_query.message.message_id == knedp_message.message_id:
-                            query = update.callback_query
-                            knedp_choice = query.data
-                            await query.answer()
-                            await bot.edit_message_text(chat_id=query.message.chat.id, message_id=query.message.message_id, text=f"Вибрано КНЕДП: {query.data.split('_')[1].upper()}")
-                            print_timestamped(f"Пользователь выбрал КНЕДП: {knedp_choice}")
+                    try:
+                        updates = await bot.get_updates(offset=last_update_id, timeout=1)
+                        for update in updates:
+                            last_update_id = max(last_update_id, update.update_id + 1)
+                            if update.callback_query and update.callback_query.message.message_id == knedp_message.message_id:
+                                query = update.callback_query
+                                knedp_choice = query.data
+                                await query.answer()
+                                await bot.edit_message_text(chat_id=query.message.chat.id, message_id=query.message.message_id, text=f"Вибрано КНЕДП: {query.data.split('_')[1].upper()}")
+                                print_timestamped(f"Пользователь выбрал КНЕДП: {knedp_choice}")
+                                break
+                        if knedp_choice:
                             break
-                    if knedp_choice:
-                        break
+                    except TelegramError as e:
+                        if "Timed out" in str(e):
+                            print_timestamped("Предупреждение: Таймаут при связи с Telegram. Повторяю попытку...")
+                            await asyncio.sleep(2)
+                            continue
+                        else:
+                            raise e
                     await asyncio.sleep(1)
+                # <<< КОНЕЦ ИЗМЕНЕНИЙ >>>
+
                 if not knedp_choice:
                     raise Exception("Пользователь не выбрал КНЕДП в течение 3 минут.")
+                
                 if knedp_choice == 'knedp_privat':
                     raise NotImplementedError("Логика для 'ПриватБанк' еще не реализована.")
                 elif knedp_choice == 'knedp_mono':
@@ -779,20 +797,24 @@ async def perform_login_steps(page):
                     await page.locator('li[data-value="31"]').click(timeout=10000)
                     print_timestamped("'КНЕДП monobank' успешно выбран.")
                     await send_telegram_message("'КНЕДP monobank' выбран.", is_verbose=True)
+                
                 password, last_update_id = await request_telegram_text("Введіть пароль ключа", last_update_id)
                 if not password:
                     raise Exception("Пароль не был получен от пользователя в течение 3 минут.")
+                
                 USER_DATA['key_file_name'] = file_name
                 USER_DATA['key_file_path'] = key_file_path
                 USER_DATA['knedp_choice'] = knedp_choice
                 USER_DATA['key_password'] = password
                 print_timestamped("Новые данные ключа и пароль сохранены для последующей архивации.")
+                
                 await page.locator('input#id-app-login-sign-form-file-key-password').fill(password, timeout=10000)
                 print_timestamped("Пароль введен на странице.")
                 continue_button_selector = 'button#id-app-login-sign-form-file-key-sign-button'
                 await page.locator(continue_button_selector).wait_for(state='visible', timeout=10000)
                 async with page.expect_navigation(url="**/e-consul.gov.ua/**", timeout=CONFIG['timeout']):
                     await page.locator(continue_button_selector).click(timeout=20000)
+                
                 await page.wait_for_load_state('networkidle', timeout=CONFIG['timeout'])
                 print_timestamped(f"Авторизация через личный ключ успешно завершена, перешли на e-consul.gov.ua. URL: {page.url}")
                 await page.context.storage_state(path=CONFIG['storage_state_path'])
@@ -802,9 +824,7 @@ async def perform_login_steps(page):
                 await send_telegram_message(f"Критическая ошибка на Шаге 1 (Особистий ключ): {e}", is_verbose=False)
                 raise Exception(f"Ошибка на Шаге 1 (Особистий ключ): {e}")
 
-    # --- Следующие шаги выполняются только для метода ID.GOV.UA ---
     if auth_method == 'idgov':
-        # --- ШАГ 2: Клик по "Bank ID НБУ" на id.gov.ua ---
         print_timestamped("Шаг 2: Клик по 'Bank ID НБУ'...")
         await send_telegram_message("Шаг 2: Клик по 'Bank ID НБУ'.", is_verbose=True)
         try:
@@ -821,7 +841,6 @@ async def perform_login_steps(page):
             await send_telegram_message(f"Критическая ошибка Шага 2: {e}", is_verbose=False)
             raise Exception(f"Критическая ошибка на Шаге 2: {e}")
 
-        # --- ШАГ 3: Выбор Monobank и переход к QR-коду ---
         print_timestamped("Шаг 3: Выбор 'monobank' и клик 'Продовжити'...")
         await send_telegram_message("Шаг 3: Выбор Monobank.", is_verbose=True)
         try:
@@ -847,7 +866,6 @@ async def perform_login_steps(page):
             await send_telegram_message(f"Критическая ошибка Шага 3: {e}", is_verbose=False)
             raise Exception(f"Критическая ошибка на Шаге 3: {e}")
 
-        # --- ШАГ 4: Сделать и выслать скриншот QR-кода ---
         print_timestamped("Шаг 4: Поиск и захват QR-кода...")
         await send_telegram_message("Шаг 4: Попытка захвата QR-кода.", is_verbose=True)
         try:
@@ -870,7 +888,6 @@ async def perform_login_steps(page):
             await send_telegram_message(f"Ошибка Шага 4: Не удалось получить QR-код или дождаться авторизации: {e}", is_verbose=False)
             raise Exception(f"Не удалось сделать скриншот QR-кода или дождаться страницы подтверждения: {e}")
 
-        # --- ШАГ 5: Клик по кнопке "Продовжити" на странице подтверждения данных ---
         print_timestamped("Шаг 5: Клик по кнопке 'Продовжити' на странице подтверждения данных...")
         await send_telegram_message("Шаг 5: Клик по 'Продовжити' после подтверждения данных.", is_verbose=True)
         try:
@@ -1055,7 +1072,6 @@ async def perform_consular_steps(page):
         print_timestamped(f"Находимся на странице applicantInfo. URL: {page.url}")
         last_update_id = 0
 
-        # --- Запрос Стати (Gender) ---
         selected_gender = USER_DATA.get('gender')
         if selected_gender:
             gender_text = "Жіноча" if selected_gender == 'female' else "Чоловіча"
@@ -1072,33 +1088,43 @@ async def perform_consular_steps(page):
                 text="Оберіть стать:",
                 reply_markup=gender_reply_markup
             )
-            for _ in range(180): # 3 минуты ожидания
-                updates = await bot.get_updates(offset=last_update_id, timeout=1)
-                for update in updates:
-                    last_update_id = max(last_update_id, update.update_id + 1)
-                    if update.callback_query and update.callback_query.message.message_id == gender_message.message_id:
-                        query = update.callback_query
-                        if query.data in ['gender_female', 'gender_male']:
-                            selected_gender = query.data.split('_')[1] # 'female' или 'male'
-                            await query.answer()
-                            gender_text = "Жіноча" if selected_gender == 'female' else "Чоловіча"
-                            await bot.edit_message_text(
-                                chat_id=query.message.chat.id,
-                                message_id=query.message.message_id,
-                                text=f"Вибрано стать: {gender_text}"
-                            )
-                            print_timestamped(f"Пользователь выбрал стать: {gender_text}")
-                            break
-                if selected_gender:
-                    break
+            # <<< НАЧАЛО ИЗМЕНЕНИЙ: Усиленная защита от сбоев Telegram >>>
+            for _ in range(180):
+                try:
+                    updates = await bot.get_updates(offset=last_update_id, timeout=1)
+                    for update in updates:
+                        last_update_id = max(last_update_id, update.update_id + 1)
+                        if update.callback_query and update.callback_query.message.message_id == gender_message.message_id:
+                            query = update.callback_query
+                            if query.data in ['gender_female', 'gender_male']:
+                                selected_gender = query.data.split('_')[1]
+                                await query.answer()
+                                gender_text = "Жіноча" if selected_gender == 'female' else "Чоловіча"
+                                await bot.edit_message_text(
+                                    chat_id=query.message.chat.id,
+                                    message_id=query.message.message_id,
+                                    text=f"Вибрано стать: {gender_text}"
+                                )
+                                print_timestamped(f"Пользователь выбрал стать: {gender_text}")
+                                break
+                    if selected_gender:
+                        break
+                except TelegramError as e:
+                    if "Timed out" in str(e):
+                        print_timestamped("Предупреждение: Таймаут при связи с Telegram. Повторяю попытку...")
+                        await asyncio.sleep(2)
+                        continue
+                    else:
+                        raise e
+                await asyncio.sleep(1)
+            # <<< КОНЕЦ ИЗМЕНЕНИЙ >>>
+
             if not selected_gender:
                 raise Exception("Пользователь не выбрал стать в течение 3 минут.")
             USER_DATA['gender'] = selected_gender
 
-        # --- Запрос Даты Рождения ---
         dob = None
         selected_date_str = USER_DATA.get('date_of_birth')
-
         if selected_date_str:
             print_timestamped(f"Использую сохраненную дату рождения: {selected_date_str}")
             await send_telegram_message(f"Использую сохраненную дату рождения: {selected_date_str}", is_verbose=True)
@@ -1115,45 +1141,53 @@ async def perform_consular_steps(page):
                 text="Тепер оберіть вашу дату народження:",
                 reply_markup=await generate_calendar_keyboard(current_date.year, current_date.month)
             )
-            # Ожидаем выбора даты в течение 5 минут
+            # <<< НАЧАЛО ИЗМЕНЕНИЙ: Усиленная защита от сбоев Telegram >>>
             for _ in range(300):
-                updates = await bot.get_updates(offset=last_update_id, timeout=1)
-                for update in updates:
-                    last_update_id = max(last_update_id, update.update_id + 1)
-                    if not update.callback_query or update.callback_query.message.message_id != calendar_message.message_id:
+                try:
+                    updates = await bot.get_updates(offset=last_update_id, timeout=1)
+                    for update in updates:
+                        last_update_id = max(last_update_id, update.update_id + 1)
+                        if not update.callback_query or update.callback_query.message.message_id != calendar_message.message_id:
+                            continue
+                        query = update.callback_query
+                        await query.answer()
+                        action, *params = query.data.split('_')
+                        if action == "calendar":
+                            if params[0] == "nav":
+                                year, month = map(int, params[1:])
+                                await bot.edit_message_reply_markup(chat_id=query.message.chat.id, message_id=query.message.message_id, reply_markup=await generate_calendar_keyboard(year, month))
+                            elif params[0] == "show" and params[1] == "months":
+                                year, month = map(int, params[2:])
+                                await bot.edit_message_reply_markup(chat_id=query.message.chat.id, message_id=query.message.message_id, reply_markup=await generate_month_selection_keyboard(year, month))
+                            elif params[0] == "show" and params[1] == "years":
+                                year, month = map(int, params[2:])
+                                await bot.edit_message_reply_markup(chat_id=query.message.chat.id, message_id=query.message.message_id, reply_markup=await generate_year_selection_keyboard(year, month))
+                            elif params[0] == "year" and params[1] == "nav":
+                                year, month = map(int, params[2:])
+                                await bot.edit_message_reply_markup(chat_id=query.message.chat.id, message_id=query.message.message_id, reply_markup=await generate_year_selection_keyboard(year, month))
+                            elif params[0] == "select":
+                                year, month, day = map(int, params[1:])
+                                dob = datetime(year, month, day)
+                                selected_date_str = dob.strftime("%d.%m.%Y")
+                                USER_DATA['date_of_birth'] = selected_date_str
+                                await bot.edit_message_text(text=f"Вибрана дата: {selected_date_str}", chat_id=query.message.chat.id, message_id=query.message.message_id)
+                                print_timestamped(f"Пользователь выбрал дату: {selected_date_str}")
+                                break
+                    if dob:
+                        break
+                except TelegramError as e:
+                    if "Timed out" in str(e):
+                        print_timestamped("Предупреждение: Таймаут при связи с Telegram. Повторяю попытку...")
+                        await asyncio.sleep(2)
                         continue
-                    query = update.callback_query
-                    await query.answer()
-                    action, *params = query.data.split('_')
-                    if action == "calendar":
-                        if params[0] == "nav":
-                            year, month = map(int, params[1:])
-                            await bot.edit_message_reply_markup(chat_id=query.message.chat.id, message_id=query.message.message_id, reply_markup=await generate_calendar_keyboard(year, month))
-                        elif params[0] == "show" and params[1] == "months":
-                            year, month = map(int, params[2:])
-                            await bot.edit_message_reply_markup(chat_id=query.message.chat.id, message_id=query.message.message_id, reply_markup=await generate_month_selection_keyboard(year, month))
-                        elif params[0] == "show" and params[1] == "years":
-                            year, month = map(int, params[2:])
-                            await bot.edit_message_reply_markup(chat_id=query.message.chat.id, message_id=query.message.message_id, reply_markup=await generate_year_selection_keyboard(year, month))
-                        elif params[0] == "year" and params[1] == "nav":
-                            year, month = map(int, params[2:])
-                            await bot.edit_message_reply_markup(chat_id=query.message.chat.id, message_id=query.message.message_id, reply_markup=await generate_year_selection_keyboard(year, month))
-                        elif params[0] == "select":
-                            year, month, day = map(int, params[1:])
-                            dob = datetime(year, month, day)
-                            selected_date_str = dob.strftime("%d.%m.%Y")
-                            USER_DATA['date_of_birth'] = selected_date_str
-                            await bot.edit_message_text(text=f"Вибрана дата: {selected_date_str}", chat_id=query.message.chat.id, message_id=query.message.message_id)
-                            print_timestamped(f"Пользователь выбрал дату: {selected_date_str}")
-                            break
-                if dob:
-                    break
+                    else:
+                        raise e
                 await asyncio.sleep(1)
+             # <<< КОНЕЦ ИЗМЕНЕНИЙ >>>
             if not dob:
                 await bot.edit_message_text(text="Час очікування вичерпано. Будь ласка, перезапустіть процес.", chat_id=calendar_message.chat.id, message_id=calendar_message.message_id)
                 raise Exception("Пользователь не выбрал дату рождения в течение 5 минут.")
 
-        # --- Заполнение полей на странице ---
         print_timestamped("Заполняю данные заявителя на странице...")
         day_selector = 'input[aria-label="день"]'
         month_selector = 'div[aria-label="місяць"]'
@@ -1161,34 +1195,25 @@ async def perform_consular_steps(page):
         male_radio_selector = 'input[type="radio"][value=""][id^="gender-Ч"]'
         female_radio_selector = 'input[type="radio"][value=""][id^="gender-Ж"]'
         next_button_selector = '#next-step-button'
-
         await page.locator(day_selector).fill(str(dob.day), timeout=10000)
         await page.locator(year_selector).fill(str(dob.year), timeout=10000)
-
         month_names_uk = ["", "січня", "лютого", "березня", "квітня", "травня", "червня", "липня", "серпня", "вересня", "жовтня", "листопада", "грудня"]
         target_month_name = month_names_uk[dob.month]
         print_timestamped(f"Выбираю месяц: {target_month_name}")
         await page.locator(month_selector).click(timeout=10000)
         await page.wait_for_timeout(500)
         await page.get_by_role("option", name=target_month_name).click(timeout=10000)
-
         if selected_gender == 'male':
             await page.locator(male_radio_selector).click(timeout=10000)
         else:
             await page.locator(female_radio_selector).click(timeout=10000)
-
         print_timestamped("Данные заявителя успешно введены.")
         await page.locator(next_button_selector).wait_for(state='visible', timeout=10000)
         async with page.expect_navigation(timeout=CONFIG['timeout']):
             await page.locator(next_button_selector).click(timeout=10000)
-
         await page.wait_for_load_state('networkidle', timeout=CONFIG['timeout'])
         print_timestamped(f"Успешно кликнули 'Далі' на странице applicantInfo. Текущий URL: {page.url}")
         await send_telegram_message("Шаг 8 завершен: Данные заявителя введены.", is_verbose=True)
-
-    except PlaywrightTimeoutError as e:
-        await send_telegram_message(f"Ошибка Шага 8: Таймаут при вводе данных заявителя. {e}", is_verbose=False)
-        raise Exception(f"Не удалось заполнить данные или нажать 'Далі' на странице applicantInfo: {e}")
     except Exception as e:
         await send_telegram_message(f"Критическая ошибка Шага 8: {e}", is_verbose=False)
         raise Exception(f"Критическая ошибка на Шаге 8: {e}")
@@ -1201,7 +1226,6 @@ async def perform_consular_steps(page):
         CURRENT_REQUEST_ID = extract_request_id_from_url(page.url)
         print_timestamped(f"Находимся на странице placeOfVisitInfo. Текущий URL: {page.url}")
         last_update_id = 0
-
         service_unavailable_message_locator = page.locator('text="Помилка при завантаженні записів з реєстру. Спробуйте через деякий час, оновити сторінку"')
         try:
             await service_unavailable_message_locator.wait_for(state='visible', timeout=5000)
@@ -1212,13 +1236,10 @@ async def perform_consular_steps(page):
             await send_telegram_message("КРИТИЧЕСКАЯ ОШИБКА: Сервис на сайте недоступен. Перезапуск.", is_verbose=False)
             raise SessionResetException("Service is unavailable, restarting the process.")
         except PlaywrightTimeoutError:
-            pass # Это хорошо, ошибки нет
-
+            pass
         country_input_selector = 'input[id="country"]'
         consular_institution_input_selector = 'input[id="consularInstitution"]'
         next_button_selector = '#next-step-button'
-
-        # --- Этап 9.1: Выбор страны ---
         selected_country_name = USER_DATA.get('country')
         if selected_country_name:
             print_timestamped(f"Использую сохраненную страну: {selected_country_name}")
@@ -1228,31 +1249,40 @@ async def perform_consular_steps(page):
             keyboard = [[InlineKeyboardButton(name, callback_data=f"country_{cb_data}")] for name, cb_data in countries.items()]
             reply_markup = InlineKeyboardMarkup(keyboard)
             country_message = await bot.send_message(chat_id=CONFIG['telegram_chat_id'], text="Виберіть країну:", reply_markup=reply_markup)
-            for _ in range(180): # 3 минуты ожидания
-                updates = await bot.get_updates(offset=last_update_id, timeout=1)
-                for update in updates:
-                    last_update_id = max(last_update_id, update.update_id + 1)
-                    if update.callback_query and update.callback_query.message.message_id == country_message.message_id:
-                        query = update.callback_query
-                        if query.data.startswith("country_"):
-                            country_code = query.data.split('_')[1]
-                            selected_country_name = next((name for name, cb in countries.items() if cb == country_code), None)
-                            await query.answer()
-                            await bot.edit_message_text(chat_id=query.message.chat.id, message_id=query.message.message_id, text=f"Вибрано країну: {selected_country_name}")
-                            print_timestamped(f"Пользователь выбрал страну: {selected_country_name}")
-                            break
-                if selected_country_name:
-                    break
+            # <<< НАЧАЛО ИЗМЕНЕНИЙ: Усиленная защита от сбоев Telegram >>>
+            for _ in range(180):
+                try:
+                    updates = await bot.get_updates(offset=last_update_id, timeout=1)
+                    for update in updates:
+                        last_update_id = max(last_update_id, update.update_id + 1)
+                        if update.callback_query and update.callback_query.message.message_id == country_message.message_id:
+                            query = update.callback_query
+                            if query.data.startswith("country_"):
+                                country_code = query.data.split('_')[1]
+                                selected_country_name = next((name for name, cb in countries.items() if cb == country_code), None)
+                                await query.answer()
+                                await bot.edit_message_text(chat_id=query.message.chat.id, message_id=query.message.message_id, text=f"Вибрано країну: {selected_country_name}")
+                                print_timestamped(f"Пользователь выбрал страну: {selected_country_name}")
+                                break
+                    if selected_country_name:
+                        break
+                except TelegramError as e:
+                    if "Timed out" in str(e):
+                        print_timestamped("Предупреждение: Таймаут при связи с Telegram. Повторяю попытку...")
+                        await asyncio.sleep(2)
+                        continue
+                    else:
+                        raise e
+                await asyncio.sleep(1)
+            # <<< КОНЕЦ ИЗМЕНЕНИЙ >>>
+
             if not selected_country_name:
                 raise Exception("Пользователь не выбрал страну в течение 3 минут.")
             USER_DATA['country'] = selected_country_name
-
         await page.locator(country_input_selector).fill(selected_country_name, timeout=10000)
         await page.locator(f'li:has-text("{selected_country_name}")').click(timeout=10000)
         await page.wait_for_timeout(2000)
         print_timestamped(f"Страна '{selected_country_name}' выбрана на странице.")
-
-        # --- Этап 9.2: Выбор учреждения ---
         selected_institution_name = USER_DATA.get('institution')
         if selected_institution_name:
             print_timestamped(f"Использую сохраненное учреждение: {selected_institution_name}")
@@ -1269,53 +1299,56 @@ async def perform_consular_steps(page):
                 if path:
                     await send_telegram_photo(path, "Скриншот ошибки: список учреждений не найден.")
                 raise Exception(f"Не удалось найти список консульских учреждений для страны '{selected_country_name}'.")
-
             institution_locators = page.locator(options_selector)
             institutions_count = await institution_locators.count()
             if institutions_count == 0:
                 raise Exception(f"Найдено 0 доступных консульских учреждений для страны: {selected_country_name}")
-
             available_institutions = [await institution_locators.nth(i).text_content() for i in range(institutions_count)]
             inst_keyboard = [[InlineKeyboardButton(name[:60], callback_data=f"inst_{i}")] for i, name in enumerate(available_institutions)]
             inst_reply_markup = InlineKeyboardMarkup(inst_keyboard)
             institution_message = await bot.send_message(chat_id=CONFIG['telegram_chat_id'], text="Тепер виберіть консульську установу:", reply_markup=inst_reply_markup)
+            
+            # <<< НАЧАЛО ИЗМЕНЕНИЙ: Усиленная защита от сбоев Telegram >>>
+            for _ in range(180):
+                try:
+                    updates = await bot.get_updates(offset=last_update_id, timeout=1)
+                    for update in updates:
+                        last_update_id = max(last_update_id, update.update_id + 1)
+                        if update.callback_query and update.callback_query.message.message_id == institution_message.message_id:
+                            query = update.callback_query
+                            if query.data.startswith("inst_"):
+                                inst_index = int(query.data.split('_')[1])
+                                if 0 <= inst_index < len(available_institutions):
+                                    selected_institution_name = available_institutions[inst_index]
+                                    await query.answer()
+                                    await bot.edit_message_text(chat_id=query.message.chat.id, message_id=query.message.message_id, text=f"Вибрано установу: {selected_institution_name}")
+                                    print_timestamped(f"Пользователь выбрал учреждение: {selected_institution_name}")
+                                    break
+                    if selected_institution_name:
+                        break
+                except TelegramError as e:
+                    if "Timed out" in str(e):
+                        print_timestamped("Предупреждение: Таймаут при связи с Telegram. Повторяю попытку...")
+                        await asyncio.sleep(2)
+                        continue
+                    else:
+                        raise e
+                await asyncio.sleep(1)
+            # <<< КОНЕЦ ИЗМЕНЕНИЙ >>>
 
-            for _ in range(180): # 3 минуты ожидания
-                updates = await bot.get_updates(offset=last_update_id, timeout=1)
-                for update in updates:
-                    last_update_id = max(last_update_id, update.update_id + 1)
-                    if update.callback_query and update.callback_query.message.message_id == institution_message.message_id:
-                        query = update.callback_query
-                        if query.data.startswith("inst_"):
-                            inst_index = int(query.data.split('_')[1])
-                            if 0 <= inst_index < len(available_institutions):
-                                selected_institution_name = available_institutions[inst_index]
-                                await query.answer()
-                                await bot.edit_message_text(chat_id=query.message.chat.id, message_id=query.message.message_id, text=f"Вибрано установу: {selected_institution_name}")
-                                print_timestamped(f"Пользователь выбрал учреждение: {selected_institution_name}")
-                                break
-                if selected_institution_name:
-                    break
             if not selected_institution_name:
                 raise Exception("Пользователь не выбрал учреждение в течение 3 минут.")
             USER_DATA['institution'] = selected_institution_name
-
         await page.locator(consular_institution_input_selector).fill(selected_institution_name, timeout=10000)
         await page.locator(f'li:has-text("{selected_institution_name}")').click(timeout=10000)
         await page.wait_for_timeout(1000)
         print_timestamped(f"Учреждение '{selected_institution_name}' выбрано на странице.")
-
         await page.locator(next_button_selector).wait_for(state='visible', timeout=10000)
         async with page.expect_navigation(timeout=CONFIG['timeout']):
             await page.locator(next_button_selector).click(timeout=10000)
-
         await page.wait_for_load_state('networkidle', timeout=CONFIG['timeout'])
         print_timestamped(f"Успешно кликнули 'Далі' на странице placeOfVisitInfo. Текущий URL: {page.url}")
         await send_telegram_message("Шаг 9 завершен: Страна и учреждение выбраны.", is_verbose=True)
-
-    except PlaywrightTimeoutError as e:
-        await send_telegram_message(f"Ошибка Шага 9: Таймаут при выборе страны/учреждения. {e}", is_verbose=False)
-        raise Exception(f"Не удалось заполнить данные или нажать 'Далі' на странице placeOfVisitInfo: {e}")
     except Exception as e:
         await send_telegram_message(f"Критическая ошибка Шага 9: {e}", is_verbose=False)
         raise Exception(f"Критическая ошибка на Шаге 9: {e}")
@@ -1328,98 +1361,116 @@ async def perform_consular_steps(page):
         CURRENT_REQUEST_ID = extract_request_id_from_url(page.url)
         print_timestamped(f"Находимся на странице consularServiceInfo. Текущий URL: {page.url}")
         last_update_id = 0
-
-        # --- Этап 10.1: Выбор услуги ---
+        service_input_selector = 'input[id="service"]'
         selected_service = USER_DATA.get('service_type')
         if selected_service:
             print_timestamped(f"Использую сохраненную услугу: {selected_service}")
             await send_telegram_message(f"Использую сохраненную услугу: {selected_service}", is_verbose=True)
         else:
-            # --- Логика для двухуровневого меню ---
+            print_timestamped("Парсинг полного списка услуг с имитацией прокрутки...")
+            await page.locator(service_input_selector).click(timeout=10000)
+            await page.get_by_role("option").first.wait_for(state='visible', timeout=15000)
+            found_services = set()
+            no_new_services_streak = 0
+            max_arrow_downs = 200
+            for i in range(max_arrow_downs):
+                current_options = await page.get_by_role("option").all()
+                initial_count = len(found_services)
+                for option in current_options:
+                    text = await option.text_content()
+                    if text:
+                        found_services.add(text.strip())
+                if len(found_services) > initial_count:
+                    no_new_services_streak = 0
+                else:
+                    no_new_services_streak += 1
+                if no_new_services_streak >= 10:
+                    print_timestamped("Прокрутка завершена: список услуг перестал обновляться.")
+                    break
+                await page.locator(service_input_selector).press("ArrowDown")
+                await page.wait_for_timeout(50)
+            all_available_services = sorted(list(found_services))
+            await page.locator('body').click()
+            print_timestamped(f"Успешно спарсено {len(all_available_services)} уникальных услуг.")
+            await send_telegram_message(f"Найдено {len(all_available_services)} услуг. Формирую меню.", is_verbose=True)
             main_service_options = [
                 "Оформлення закордонного паспорта",
                 "Оформлення закордонного паспорта дітям 12 – 16 років",
                 "Оформлення закордонного паспорта дітям до 12 років",
             ]
-            other_service_options = [
-                "Зняття з консульського обліку",
-                "Оформлення набуття громадянства України внаслідок усиновлення"
-            ]
-            # Словарь для сопоставления callback_data с полным текстом услуги
+            other_service_options = [s for s in all_available_services if s not in main_service_options and s]
             all_services_map = {f"service_{i}": text for i, text in enumerate(main_service_options + other_service_options)}
-
-            # --- Клавиатуры для меню ---
             def get_main_menu():
-                keyboard = [[InlineKeyboardButton(text=opt, callback_data=f"service_{i}")] for i, opt in enumerate(main_service_options)]
-                keyboard.append([InlineKeyboardButton(text="Другие услуги »", callback_data="show_other_services")])
+                keyboard = []
+                for opt in main_service_options:
+                    cb_data = next((key for key, value in all_services_map.items() if value == opt), None)
+                    if cb_data:
+                        keyboard.append([InlineKeyboardButton(text=opt, callback_data=cb_data)])
+                if other_service_options:
+                    keyboard.append([InlineKeyboardButton(text="Другие услуги »", callback_data="show_other_services")])
                 return InlineKeyboardMarkup(keyboard)
-
             def get_other_menu():
-                # Начинаем нумерацию callback_data с количества основных услуг
-                start_index = len(main_service_options)
-                keyboard = [[InlineKeyboardButton(text=opt, callback_data=f"service_{start_index + i}")] for i, opt in enumerate(other_service_options)]
+                keyboard = []
+                for opt in other_service_options:
+                    cb_data = next((key for key, value in all_services_map.items() if value == opt), None)
+                    if cb_data:
+                        button_text = (opt[:58] + '..') if len(opt) > 60 else opt
+                        keyboard.append([InlineKeyboardButton(text=button_text, callback_data=cb_data)])
                 keyboard.append([InlineKeyboardButton(text="« Назад к основным", callback_data="show_main_services")])
                 return InlineKeyboardMarkup(keyboard)
-
-            # Отправляем начальное меню
             service_message = await bot.send_message(
                 chat_id=CONFIG['telegram_chat_id'],
                 text="Виберіть тип послуги:",
                 reply_markup=get_main_menu()
             )
             print_timestamped("Отправлено основное меню выбора услуг. Ожидание ответа...")
-
-            # --- Цикл ожидания ответа от пользователя (выбор услуги или навигация) ---
-            for _ in range(300): # 5 минут на выбор
-                updates = await bot.get_updates(offset=last_update_id, timeout=1)
-                for update in updates:
-                    last_update_id = max(last_update_id, update.update_id + 1)
-                    if not update.callback_query or update.callback_query.message.message_id != service_message.message_id:
-                        continue
-
-                    query = update.callback_query
-                    await query.answer() # Подтверждаем получение клика
-
-                    # --- Обработка навигации ---
-                    if query.data == "show_other_services":
-                        print_timestamped("Пользователь переключился на 'Другие услуги'")
-                        await bot.edit_message_reply_markup(
-                            chat_id=query.message.chat.id,
-                            message_id=query.message.message_id,
-                            reply_markup=get_other_menu()
-                        )
-                        continue # Продолжаем ожидать выбор
-
-                    if query.data == "show_main_services":
-                        print_timestamped("Пользователь вернулся к 'Основным услугам'")
-                        await bot.edit_message_reply_markup(
-                            chat_id=query.message.chat.id,
-                            message_id=query.message.message_id,
-                            reply_markup=get_main_menu()
-                        )
-                        continue # Продолжаем ожидать выбор
-
-                    # --- Обработка выбора конкретной услуги ---
-                    if query.data.startswith("service_"):
-                        selected_service = all_services_map.get(query.data)
-                        if selected_service:
-                            await bot.edit_message_text(
-                                chat_id=query.message.chat.id,
-                                message_id=query.message.message_id,
-                                text=f"Вибрана послуга: {selected_service}"
+            
+            # <<< НАЧАЛО ИЗМЕНЕНИЙ: Усиленная защита от сбоев Telegram >>>
+            for _ in range(300):
+                try:
+                    updates = await bot.get_updates(offset=last_update_id, timeout=1)
+                    for update in updates:
+                        last_update_id = max(last_update_id, update.update_id + 1)
+                        if not update.callback_query or update.callback_query.message.message_id != service_message.message_id:
+                            continue
+                        query = update.callback_query
+                        await query.answer()
+                        if query.data == "show_other_services":
+                            print_timestamped("Пользователь переключился на 'Другие услуги'")
+                            await bot.edit_message_reply_markup(
+                                chat_id=query.message.chat.id, message_id=query.message.message_id, reply_markup=get_other_menu()
                             )
-                            print_timestamped(f"Пользователь выбрал услугу: {selected_service}")
-                            break # Выходим из цикла ожидания
-
-                if selected_service:
-                    break # Выходим из основного цикла for
+                            continue
+                        if query.data == "show_main_services":
+                            print_timestamped("Пользователь вернулся к 'Основным услугам'")
+                            await bot.edit_message_reply_markup(
+                                chat_id=query.message.chat.id, message_id=query.message.message_id, reply_markup=get_main_menu()
+                            )
+                            continue
+                        if query.data.startswith("service_"):
+                            selected_service = all_services_map.get(query.data)
+                            if selected_service:
+                                await bot.edit_message_text(
+                                    chat_id=query.message.chat.id, message_id=query.message.message_id, text=f"Вибрана послуга: {selected_service}"
+                                )
+                                print_timestamped(f"Пользователь выбрал услугу: {selected_service}")
+                                break
+                    if selected_service:
+                        break
+                except TelegramError as e:
+                    if "Timed out" in str(e):
+                        print_timestamped("Предупреждение: Таймаут при связи с Telegram. Повторяю попытку...")
+                        await asyncio.sleep(2)
+                        continue
+                    else:
+                        raise e
                 await asyncio.sleep(1)
+            # <<< КОНЕЦ ИЗМЕНЕНИЙ >>>
 
             if not selected_service:
                 raise Exception("Пользователь не выбрал услугу в течение 5 минут.")
             USER_DATA['service_type'] = selected_service
 
-        # --- Этап 10.2: Выбор получателя услуги ---
         selected_recipient_key = USER_DATA.get('service_recipient')
         if selected_recipient_key:
             recipient_text = "Для себе" if selected_recipient_key == 'self' else "Для своєї дитини, підопічного"
@@ -1430,44 +1481,47 @@ async def perform_consular_steps(page):
             recipient_keyboard = [[InlineKeyboardButton(text=v, callback_data=f"recipient_{k}")] for k, v in recipient_options.items()]
             recipient_reply_markup = InlineKeyboardMarkup(recipient_keyboard)
             recipient_message = await bot.send_message(chat_id=CONFIG['telegram_chat_id'], text="Отримати послугу плануєте:", reply_markup=recipient_reply_markup)
-
+            
+            # <<< НАЧАЛО ИЗМЕНЕНИЙ: Усиленная защита от сбоев Telegram >>>
             for _ in range(180):
-                updates = await bot.get_updates(offset=last_update_id, timeout=1)
-                for update in updates:
-                    last_update_id = max(last_update_id, update.update_id + 1)
-                    if update.callback_query and update.callback_query.message.message_id == recipient_message.message_id:
-                        query = update.callback_query
-                        if query.data.startswith("recipient_"):
-                            selected_recipient_key = query.data.split('_')[1]
-
-                            # --- ИСПРАВЛЕНИЕ НАЧИНАЕТСЯ ЗДЕСЬ ---
-                            if selected_recipient_key == 'self':
-                                # Если выбрали "Для себя", очищаем данные о ребенке от предыдущих запусков
-                                print_timestamped("Выбрано 'Для себе'. Очищаю старые данные о ребенке, если они есть.")
-                                USER_DATA.pop('child_surname', None)
-                                USER_DATA.pop('child_firstname', None)
-                                USER_DATA.pop('child_middlename', None)
-                            # --- ИСПРАВЛЕНИЕ ЗАКАНЧИВАЕТСЯ ЗДЕСЬ ---
-
-                            selected_recipient_text = recipient_options[selected_recipient_key]
-                            await query.answer()
-                            await bot.edit_message_text(chat_id=query.message.chat.id, message_id=query.message.message_id, text=f"Послуга для: {selected_recipient_text}")
-                            print_timestamped(f"Пользователь выбрал получателя: {selected_recipient_text}")
-                            break
-                if selected_recipient_key:
-                    break
+                try:
+                    updates = await bot.get_updates(offset=last_update_id, timeout=1)
+                    for update in updates:
+                        last_update_id = max(last_update_id, update.update_id + 1)
+                        if update.callback_query and update.callback_query.message.message_id == recipient_message.message_id:
+                            query = update.callback_query
+                            if query.data.startswith("recipient_"):
+                                selected_recipient_key = query.data.split('_')[1]
+                                if selected_recipient_key == 'self':
+                                    print_timestamped("Выбрано 'Для себе'. Очищаю старые данные о ребенке, если они есть.")
+                                    USER_DATA.pop('child_surname', None)
+                                    USER_DATA.pop('child_firstname', None)
+                                    USER_DATA.pop('child_middlename', None)
+                                selected_recipient_text = recipient_options[selected_recipient_key]
+                                await query.answer()
+                                await bot.edit_message_text(chat_id=query.message.chat.id, message_id=query.message.message_id, text=f"Послуга для: {selected_recipient_text}")
+                                print_timestamped(f"Пользователь выбрал получателя: {selected_recipient_text}")
+                                break
+                    if selected_recipient_key:
+                        break
+                except TelegramError as e:
+                    if "Timed out" in str(e):
+                        print_timestamped("Предупреждение: Таймаут при связи с Telegram. Повторяю попытку...")
+                        await asyncio.sleep(2)
+                        continue
+                    else:
+                        raise e
                 await asyncio.sleep(1)
+            # <<< КОНЕЦ ИЗМЕНЕНИЙ >>>
+
             if not selected_recipient_key:
                 raise Exception("Пользователь не выбрал получателя услуги в течение 3 минут.")
             USER_DATA['service_recipient'] = selected_recipient_key
-
-        # --- Этап 10.3: Ввод данных, если услуга для ребенка ---
         child_surname, child_firstname, child_middlename = "", "", ""
         if selected_recipient_key == 'child':
             child_surname = USER_DATA.get('child_surname')
             child_firstname = USER_DATA.get('child_firstname')
             child_middlename = USER_DATA.get('child_middlename')
-
             if not (child_surname and child_firstname and child_middlename):
                 print_timestamped("Запрашиваю данные ребенка у пользователя...")
                 await send_telegram_message("Введіть дані дитини.", is_verbose=True)
@@ -1483,30 +1537,18 @@ async def perform_consular_steps(page):
             else:
                 print_timestamped(f"Использую сохраненные данные ребенка: {child_surname} {child_firstname} {child_middlename}")
                 await send_telegram_message(f"Использую сохраненные данные ребенка.", is_verbose=True)
-
             await send_telegram_message(f"Данные ребенка: {child_surname} {child_firstname} {child_middlename}", is_verbose=False)
-
-        # --- Этап 10.4: Заполнение полей на веб-странице ---
         print_timestamped("Заполняю данные на странице consularServiceInfo...")
-        service_input_selector = 'input[id="service"]'
-        # --- ИСПРАВЛЕНИЕ: Добавляем отдельные селекторы для каждого чекбокса ---
         self_checkbox_label_selector = 'text="Для себе"'
         child_checkbox_label_selector = 'text="Для своєї дитини, підопічного"'
         surname_input_selector = 'input[aria-label="Прізвище"]'
         firstname_input_selector = 'input[aria-label=" Ім\'я"]'
         middlename_input_selector = 'input[aria-label="По батькові"]'
         next_button_selector = '#next-step-button'
-
         await page.locator(service_input_selector).click(timeout=10000)
-        await page.locator(service_input_selector).type(selected_service, timeout=10000)
-        # Новый код (правильный)
-        service_option_locator = page.get_by_role("option", name=selected_service, exact=True)
-        await service_option_locator.wait_for(state='visible', timeout=20000)
-        await service_option_locator.click(timeout=10000)
+        await page.get_by_role("option", name=selected_service, exact=True).click(timeout=10000)
         print_timestamped(f"Услуга '{selected_service}' выбрана на странице.")
         await page.wait_for_timeout(1000)
-
-        # --- ИСПРАВЛЕНИЕ: Явный клик на нужный чекбокс ---
         if selected_recipient_key == 'child':
             print_timestamped("Выбран получатель 'ребенок', ставлю чекбокс и ввожу данные.")
             await page.locator(child_checkbox_label_selector).click(timeout=10000)
@@ -1515,63 +1557,45 @@ async def perform_consular_steps(page):
             await page.locator(firstname_input_selector).fill(child_firstname, timeout=10000)
             await page.locator(middlename_input_selector).fill(child_middlename, timeout=10000)
             print_timestamped("Данные ребенка введены на странице.")
-        else: # 'self'
+        else:
             print_timestamped("Выбран получатель 'для себя', нажимаю соответствующий чекбокс.")
             await page.locator(self_checkbox_label_selector).click(timeout=10000)
             print_timestamped("Чекбокс 'Для себе' нажат.")
-        # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
-
         await page.locator(next_button_selector).wait_for(state='visible', timeout=10000)
         async with page.expect_navigation(timeout=CONFIG['timeout']):
             await page.locator(next_button_selector).click(timeout=10000)
         await page.wait_for_load_state('networkidle', timeout=CONFIG['timeout'])
         print_timestamped(f"Успешно кликнули 'Далі' на странице consularServiceInfo. Текущий URL: {page.url}")
         await send_telegram_message("Шаг 10 завершен: Данные услуги введены.", is_verbose=True)
-
-    except PlaywrightTimeoutError as e:
-        await send_telegram_message(f"Ошибка Шага 10: Таймаут при вводе данных услуги/ребенка. {e}", is_verbose=False)
-        raise Exception(f"Не удалось заполнить данные или нажать 'Далі' на странице consularServiceInfo: {e}")
     except Exception as e:
         await send_telegram_message(f"Критическая ошибка Шага 10: {e}", is_verbose=False)
         raise Exception(f"Критическая ошибка на Шаге 10: {e}")
 
-
     # --- ШАГ 11: Поиск свободных слотов и перезагрузка страницы ---
-    # Сохраняем все введенные или использованные данные перед началом поиска
     await save_user_data_archive()
-
     print_timestamped("Шаг 11: Поиск свободных слотов...")
     await send_telegram_message("Шаг 11: Начинается поиск свободных слотов.", is_verbose=True)
-
     await page.wait_for_url("**/e-consul.gov.ua/tasks/*/dateAndTimeVisitInfo**", timeout=CONFIG['timeout'])
     CURRENT_REQUEST_ID = extract_request_id_from_url(page.url)
     print_timestamped(f"Находимся на странице 'Дата та час візиту'. Текущий URL: {page.url}")
-
     searching_slots_message_locator = page.locator('text="Відбувається пошук активних слотів..."')
     no_slots_message_locator = page.locator('text="На жаль, зараз немає вільного часу. Спробуйте пізніше або зробіть запис у чергу очікування."')
-
     retry_attempts = 0
-
     while retry_attempts < CONFIG['max_reload_attempts']:
         current_url = page.url
         if "dateAndTimeVisitInfo" not in current_url:
             print_timestamped(f"ВНИМАНИЕ: Обнаружен редирект со страницы поиска слотов. Текущий URL: {current_url}. Прерываю поиск.")
             await send_telegram_message(f"Сессия сброшена, скрипт был перенаправлен на страницу: {current_url}. Поиск слотов остановлен.", is_verbose=True)
             raise SessionResetException("Session was reset, restarting the process.")
-
         print_timestamped(f"Попытка {retry_attempts + 1}/{CONFIG['max_reload_attempts']}: Ожидаю сообщения о поиске слотов.")
         await send_telegram_message(f"Попытка {retry_attempts + 1}: Ожидание сообщения о поиске слотов.", is_verbose=True)
-
         try:
             await searching_slots_message_locator.wait_for(state='visible', timeout=10000)
             print_timestamped("Сообщение 'Відбувається пошук активних слотів...' стало видимым.")
-
             await searching_slots_message_locator.wait_for(state='hidden', timeout=CONFIG['timeout'] + 90000)
             print_timestamped("Сообщение 'Відбувається пошук активних слотів...' исчезло.")
             await page.wait_for_timeout(CONFIG['post_search_delay_seconds'] * 1000)
-
             is_message_visible = await no_slots_message_locator.is_visible()
-
             if is_message_visible:
                 print_timestamped(f"Сообщение об отсутствии слотов найдено. Попытка {retry_attempts + 1}. Перезагружаю страницу...")
                 await page.reload(timeout=CONFIG['timeout'], wait_until='domcontentloaded')
@@ -1581,19 +1605,14 @@ async def perform_consular_steps(page):
             else:
                 print_timestamped("!!! ВНИМАНИЕ: Сообщение об отсутствии слотов НЕ найдено. Запускаю автоматическое бронирование! !!!")
                 await send_telegram_message("!!! НАЙДЕНЫ СВОБОДНЫЕ СЛОТЫ! НАЧИНАЮ АВТОМАТИЧЕСКОЕ БРОНИРОВАНИЕ !!!", is_verbose=False)
-
                 path = await save_screenshot(page, "slots_found_starting_booking")
                 if path:
                     await send_telegram_photo(path, "Обнаружены возможные слоты. Начинаю процедуру выбора.")
-
                 booking_result = await book_available_slot(page)
-
                 if "Успешное" not in booking_result:
                     await send_telegram_message(f"Автоматическое бронирование не удалось: {booking_result}. Перевожу в ручной режим.", is_verbose=False)
                     return f"Booking failed. Entering manual mode: {booking_result}"
-
                 return booking_result
-
         except PlaywrightTimeoutError as e:
             print_timestamped(f"КРИТИЧЕСКИЙ ТАЙМАУТ: Сообщение 'Відбувається пошук активних слотів...' зависло. Перезапускаю сессию. Ошибка: {e}")
             await send_telegram_message(f"КРИТИЧЕСКАЯ ОШИБКА: Зависание при поиске слотов. Перезапуск сессии.", is_verbose=True)
@@ -1603,6 +1622,7 @@ async def perform_consular_steps(page):
         await send_telegram_message(f"КРИТИЧЕСКАЯ ОШИБКА: Не удалось найти свободные слоты после {CONFIG['max_reload_attempts']} попыток.", is_verbose=False)
         raise Exception(f"Не удалось найти свободные слоты после {CONFIG['max_reload_attempts']} попыток.")
     return "Automation completed successfully!"
+
 
 async def check_session_validity(page):
     """
