@@ -1545,7 +1545,12 @@ async def perform_consular_steps(page):
         firstname_input_selector = 'input[aria-label=" Ім\'я"]'
         middlename_input_selector = 'input[aria-label="По батькові"]'
         next_button_selector = '#next-step-button'
-        await page.locator(service_input_selector).click(timeout=10000)
+        # ИСПРАВЛЕНИЕ: Вместо простого клика, сначала заполняем поле для фильтрации списка.
+        # Это делает видимым даже тот элемент, который находится далеко внизу.
+        await page.locator(service_input_selector).fill(selected_service, timeout=10000)
+        #Небольшая пауза, чтобы список на странице успел отфильтроваться.
+        await page.wait_for_timeout(1000)
+        # Теперь кликаем по отфильтрованному (и гарантированно видимому) элементу.
         await page.get_by_role("option", name=selected_service, exact=True).click(timeout=10000)
         print_timestamped(f"Услуга '{selected_service}' выбрана на странице.")
         await page.wait_for_timeout(1000)
