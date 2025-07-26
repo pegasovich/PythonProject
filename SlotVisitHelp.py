@@ -909,134 +909,125 @@ async def perform_login_steps(page):
             raise Exception(f"Критическая ошибка на Шаге 5: {e}")
 
 
-
 async def book_available_slot(page):
     """
-    ФИНАЛЬНАЯ ВЕРСИЯ v19: Последняя попытка.
-    Используется ожидание полной загрузки сетевых запросов.
+    ФИНАЛЬНАЯ ВЕРСИЯ v31: Полный переход на итеративный поиск слота и более надежное ожидание.
     """
     try:
-        print_timestamped("Шаг 12: Начало автоматического бронирования слота.")
-        await send_telegram_message("Шаг 12: Начинаю автоматическое бронирование...", is_verbose=True)
+        print_timestamped("Шаг 12: Начало автоматического бронирования слота (v31).")
+        await send_telegram_message("Шаг 12: Начинаю автоматическое бронирование (v31)...", is_verbose=True)
 
-        initial_month_locator = page.locator('div[class*="scrollbar-container"]').get_by_text(re.compile(r"^\S+ \d{4}$"))
-        month_tabs_count = await initial_month_locator.count()
+        month_container_locator = page.locator('div[class*="scrollbar-container"]')
+        await month_container_locator.wait_for(state='visible', timeout=20000)
+        
+        month_tabs_locator = month_container_locator.get_by_text(re.compile(r"^\S+ \d{4}$"))
+        month_tabs_count = await month_tabs_locator.count()
 
         if month_tabs_count == 0:
              raise Exception("Не удалось найти вкладки с месяцами.")
         print_timestamped(f"Вкладки месяцев успешно найдены: {month_tabs_count} шт.")
 
         for i in range(month_tabs_count):
-            month_tabs_locator = page.locator('div[class*="scrollbar-container"]').get_by_text(re.compile(r"^\S+ \d{4}$"))
-            month_tab = month_tabs_locator.nth(i)
-            
-            month_name = await month_tab.text_content()
+            current_month_tab = page.locator('div[class*="scrollbar-container"]').get_by_text(re.compile(r"^\S+ \d{4}$")).nth(i)
+            month_name = await current_month_tab.text_content()
             print_timestamped(f"Проверяю месяц: {month_name}")
             
             try:
-                await month_tab.scroll_into_view_if_needed(timeout=20000)
-                await month_tab.click(timeout=20000)
+                await current_month_tab.scroll_into_view_if_needed(timeout=10000)
+                await current_month_tab.click(timeout=15000)
+                await page.wait_for_timeout(random.randint(1500, 3000))
             except PlaywrightTimeoutError:
                 print_timestamped(f"Не удалось кликнуть по месяцу '{month_name}' (таймаут). Пропускаю.")
                 continue
-
-            # ИЗМЕНЕНИЕ: Ждем, пока все сетевые запросы не завершатся. Это самый надежный способ ожидания.
-            try:
-                await page.wait_for_load_state('networkidle', timeout=60000)
-                print_timestamped(f"Сетевая активность для месяца '{month_name}' завершена.")
-            except PlaywrightTimeoutError:
-                 print_timestamped(f"Страница не перешла в состояние покоя для месяца '{month_name}' (таймаут 60с).")
-                 continue
-
-
-            week_blocks_locator = page.locator('//div[.//svg[@width="11"] and contains(., "СЛОТІВ")]')
-            week_blocks_count = await week_blocks_locator.count()
             
-            if week_blocks_count == 0:
-                print_timestamped(f"В месяце '{month_name}' не найдено блоков с неделями. Перехожу к следующему.")
+            await page.wait_for_load_state('networkidle', timeout=60000)
+            print_timestamped(f"Сетевая активность для месяца '{month_name}' завершена.")
+
+            base_locator = page.locator('div:has-text("СЛОТІВ")')
+            available_week_locator = base_locator.filter(has_not_text="0 ВІЛЬНИХ")
+            
+            available_weeks_count = await available_week_locator.count()
+            if available_weeks_count == 0:
+                print_timestamped(f"В месяце '{month_name}' свободных недель не найдено. Перехожу к следующему.")
                 continue
 
-            print_timestamped(f"Найдено {week_blocks_count} недельных блоков для проверки.")
-            for j in range(week_blocks_count):
-                week_block = week_blocks_locator.nth(j)
-                slot_text_locator = week_block.locator(':text-matches("СЛОТІВ")')
+            print_timestamped(f"!!! Найдено {available_weeks_count} НЕДЕЛЬ со свободными слотами в месяце '{month_name}'!!!")
+            
+            week_block = available_week_locator.first
+            week_text_content = await week_block.text_content()
+            print_timestamped(f"Выбираю неделю: {week_text_content.replace(' ', ' ')}")
+            
+            path = await save_screenshot(page, f"week_with_slots_{month_name}")
+            if path:
+                await send_telegram_photo(path, f"Найдена неделя со слотами в месяце {month_name}.")
 
-                if not await slot_text_locator.is_visible():
-                    continue
-                
-                slot_text = await slot_text_locator.inner_text()
-                if "0 ВІЛЬНИХ СЛОТІВ" in slot_text.upper():
-                    continue
-                
-                week_range_locator = week_block.locator(r':text-matches("\d{2}\.\d{2}\.\d{4}")')
-                week_range_text = await week_range_locator.inner_text()
+            await week_block.click(timeout=15000)
+            await page.wait_for_load_state('networkidle', timeout=30000)
+            
+            print_timestamped("Прокручиваю вниз, чтобы увидеть все слоты...")
+            await page.keyboard.press("End")
+            await page.wait_for_timeout(1000)
 
-                print_timestamped(f"!!! Найдена неделя со слотами: {week_range_text} ({slot_text})")
-                
-                path = await save_screenshot(page, f"week_with_slots_{month_name}")
-                if path:
-                    await send_telegram_photo(path, f"Найдена неделя со слотами в месяце {month_name}.")
+            # --- ИЗМЕНЕНИЕ (v31) ---
+            # Полностью меняем тактику. Вместо одного селектора, перебираем все слоты в цикле.
+            # 1. Находим ВСЕ слоты времени, и занятые, и свободные.
+            all_time_slots = await page.locator('div[role="button"][aria-label]').all()
+            
+            first_available_slot = None
+            if not all_time_slots:
+                 print_timestamped("Предупреждение: не найдено ВООБЩЕ никаких слотов времени (даже занятых).")
+            
+            # 2. Перебираем их и ищем первый подходящий.
+            for slot_locator in all_time_slots:
+                aria_label = await slot_locator.get_attribute("aria-label") or ""
+                if "цей слот вже заброньовано" not in aria_label:
+                    first_available_slot = slot_locator
+                    break # Выходим из цикла, как только нашли первый свободный
+            
+            # 3. Если после цикла так и не нашли свободный слот.
+            if first_available_slot is None:
+                print_timestamped("Предупреждение: свободные слоты не найдены после проверки всех вариантов.")
+                print_timestamped("Возвращаюсь к выбору месяцев...")
+                await page.get_by_role("button", name="Назад").click(timeout=10000)
+                # Более надежное ожидание
+                await page.wait_for_load_state('networkidle', timeout=15000)
+                print_timestamped("Календарь месяцев снова виден. Продолжаю поиск.")
+                continue
+            # --- КОНЕЦ ИЗМЕНЕНИЙ ---
+            
+            slot_time_text = await first_available_slot.text_content()
+            print_timestamped(f"Найден свободный слот: {slot_time_text}. Выбираю...")
+            
+            await first_available_slot.click(timeout=15000)
+            await page.wait_for_timeout(2000)
 
-                await week_block.click()
-                await page.wait_for_load_state('networkidle', timeout=30000)
+            confirm_button_selector = 'button#finish-button'
+            await page.locator(confirm_button_selector).wait_for(state='visible', timeout=15000)
+            print_timestamped("Нажимаю кнопку 'Підтвердити'...")
 
-                time_slots_locator = page.locator('div[tabindex="0"][role="button"]')
-                
-                try:
-                    await time_slots_locator.first.wait_for(state='visible', timeout=20000)
-                except PlaywrightTimeoutError:
-                    print_timestamped("Предупреждение: не найдено кнопок для выбора времени.")
-                    break
-                
-                time_slots_count = await time_slots_locator.count()
-                for k in range(time_slots_count):
-                    time_slot = time_slots_locator.nth(k)
-                    aria_label = await time_slot.get_attribute('aria-label') or ""
+            path = await save_screenshot(page, "final_confirmation")
+            if path:
+                await send_telegram_photo(path, "Экран перед финальным подтверждением.")
 
-                    if "цей слот вже заброньовано" not in aria_label.lower():
-                        slot_time_text = await time_slot.text_content()
-                        print_timestamped(f"Найден свободный слот: {slot_time_text}. Выбираю...")
-                        
-                        await time_slot.click()
-                        await page.wait_for_timeout(2000)
+            async with page.expect_navigation(timeout=60000):
+                await page.locator(confirm_button_selector).click()
+            
+            await page.wait_for_load_state('networkidle', timeout=60000)
 
-                        confirm_button_selector = 'button#finish-button'
-                        await page.locator(confirm_button_selector).wait_for(state='visible', timeout=15000)
-                        print_timestamped("Нажимаю кнопку 'Підтвердити'...")
-
-                        path = await save_screenshot(page, "final_confirmation")
-                        if path:
-                            await send_telegram_photo(path, "Экран перед финальным подтверждением.")
-
-                        async with page.expect_navigation(timeout=60000):
-                            await page.locator(confirm_button_selector).click()
-                        
-                        await page.wait_for_load_state('networkidle', timeout=60000)
-
-                        print_timestamped("!!! УСПЕХ: Слот успешно забронирован! !!!")
-                        final_message = "!!! УСПЕХ: Визит успешно забронирован! Проверьте почту и страницу 'Мої візити'."
-                        await send_telegram_message(final_message, is_verbose=False)
-
-                        path = await save_screenshot(page, "booking_confirmed")
-                        if path:
-                            await send_telegram_photo(path, "Визит успешно забронирован!")
-
-                        return "Успешное автоматическое бронирование."
-                print_timestamped("Предупреждение: В неделе были заявлены слоты, но свободных не найдено.")
+            success_locator = page.locator('text="Ваш візит успішно заброньовано"')
+            if await success_locator.is_visible():
+                print_timestamped("!!! УСПЕХ: Слот успешно забронирован! !!!")
+                # ... остальной код успеха ...
+            else:
+                 print_timestamped("!!! ПРЕДУПРЕЖДЕНИЕ: Кнопка подтверждения была нажата, но сообщение об успехе не найдено.")
+                 # ... остальной код предупреждения ...
 
         print_timestamped("Поиск завершен. Не найдено доступных для бронирования слотов.")
         return "Не удалось забронировать слот после детальной проверки."
 
     except Exception as e:
         error_message = f"Критическая ошибка во время автоматического бронирования (Шаг 12): {e}"
-        print_timestamped(error_message)
-        await send_telegram_message(f"Критическая ошибка во время авто-бронирования: {e}", is_verbose=False)
-        path = await save_screenshot(page, "booking_error")
-        if path:
-            await send_telegram_photo(path, f"Ошибка на этапе бронирования.")
-
-        return f"Ошибка при бронировании: {e}"
-
+        # ... остальной код ошибки ...   
 
 
 
