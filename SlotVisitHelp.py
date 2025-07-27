@@ -3,7 +3,7 @@ import os
 import random
 from datetime import datetime
 import httpx # Импортируем httpx для перехвата ошибок соединения
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError, Keyboard
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError, Keyboard, expect
 # ОБНОВЛЕННЫЙ ИМПОРТ: Добавлены классы для интерактивных кнопок
 from telegram import Bot, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.error import TelegramError
@@ -909,13 +909,15 @@ async def perform_login_steps(page):
             raise Exception(f"Критическая ошибка на Шаге 5: {e}")
 
 
+
+
 async def book_available_slot(page):
     """
-    ФИНАЛЬНАЯ ВЕРСИЯ v31: Полный переход на итеративный поиск слота и более надежное ожидание.
+    ФИНАЛЬНАЯ ВЕРСИЯ v33: Исправлен регистр буквы в локаторе финального сообщения.
     """
     try:
-        print_timestamped("Шаг 12: Начало автоматического бронирования слота (v31).")
-        await send_telegram_message("Шаг 12: Начинаю автоматическое бронирование (v31)...", is_verbose=True)
+        print_timestamped("Шаг 12: Начало автоматического бронирования слота (v33).")
+        await send_telegram_message("Шаг 12: Начинаю автоматическое бронирование (v33)...", is_verbose=True)
 
         month_container_locator = page.locator('div[class*="scrollbar-container"]')
         await month_container_locator.wait_for(state='visible', timeout=20000)
@@ -968,32 +970,25 @@ async def book_available_slot(page):
             await page.keyboard.press("End")
             await page.wait_for_timeout(1000)
 
-            # --- ИЗМЕНЕНИЕ (v31) ---
-            # Полностью меняем тактику. Вместо одного селектора, перебираем все слоты в цикле.
-            # 1. Находим ВСЕ слоты времени, и занятые, и свободные.
             all_time_slots = await page.locator('div[role="button"][aria-label]').all()
             
             first_available_slot = None
             if not all_time_slots:
                  print_timestamped("Предупреждение: не найдено ВООБЩЕ никаких слотов времени (даже занятых).")
             
-            # 2. Перебираем их и ищем первый подходящий.
             for slot_locator in all_time_slots:
                 aria_label = await slot_locator.get_attribute("aria-label") or ""
                 if "цей слот вже заброньовано" not in aria_label:
                     first_available_slot = slot_locator
-                    break # Выходим из цикла, как только нашли первый свободный
+                    break 
             
-            # 3. Если после цикла так и не нашли свободный слот.
             if first_available_slot is None:
                 print_timestamped("Предупреждение: свободные слоты не найдены после проверки всех вариантов.")
                 print_timestamped("Возвращаюсь к выбору месяцев...")
                 await page.get_by_role("button", name="Назад").click(timeout=10000)
-                # Более надежное ожидание
                 await page.wait_for_load_state('networkidle', timeout=15000)
                 print_timestamped("Календарь месяцев снова виден. Продолжаю поиск.")
                 continue
-            # --- КОНЕЦ ИЗМЕНЕНИЙ ---
             
             slot_time_text = await first_available_slot.text_content()
             print_timestamped(f"Найден свободный слот: {slot_time_text}. Выбираю...")
@@ -1009,25 +1004,46 @@ async def book_available_slot(page):
             if path:
                 await send_telegram_photo(path, "Экран перед финальным подтверждением.")
 
-            async with page.expect_navigation(timeout=60000):
-                await page.locator(confirm_button_selector).click()
+            await page.locator(confirm_button_selector).click()
             
-            await page.wait_for_load_state('networkidle', timeout=60000)
-
+            # --- ИЗМЕНЕНИЕ (v33) ---
+            # Исправлена большая буква "В" на маленькую "в" в соответствии с HTML-кодом сайта.
+            processing_locator = page.locator('text="Дякуємо, ми обробляємо ваш запит"')
             success_locator = page.locator('text="Ваш візит успішно заброньовано"')
-            if await success_locator.is_visible():
+            # --- КОНЕЦ ИЗМЕНЕНИЙ ---
+
+            await expect(processing_locator.or_(success_locator)).to_be_visible(timeout=60000)
+            
+            if await processing_locator.is_visible():
+                print_timestamped("!!! УСПЕХ: Запрос на бронирование отправлен! !!!")
+                final_message = "!!! УСПЕХ: Запрос на бронирование отправлен! Ожидайте подтверждения."
+                await send_telegram_message(final_message, is_verbose=False)
+                
+                path = await save_screenshot(page, "booking_processing")
+                if path:
+                    await send_telegram_photo(path, "Запрос на бронирование обрабатывается.")
+            
+            elif await success_locator.is_visible():
                 print_timestamped("!!! УСПЕХ: Слот успешно забронирован! !!!")
-                # ... остальной код успеха ...
-            else:
-                 print_timestamped("!!! ПРЕДУПРЕЖДЕНИЕ: Кнопка подтверждения была нажата, но сообщение об успехе не найдено.")
-                 # ... остальной код предупреждения ...
+                final_message = "!!! УСПЕХ: Визит успешно забронирован! Проверьте почту и страницу 'Мої візити'."
+                await send_telegram_message(final_message, is_verbose=False)
+                path = await save_screenshot(page, "booking_confirmed")
+                if path:
+                    await send_telegram_photo(path, "Визит успешно забронирован!")
+
+            return "Успешное автоматическое бронирование."
 
         print_timestamped("Поиск завершен. Не найдено доступных для бронирования слотов.")
         return "Не удалось забронировать слот после детальной проверки."
 
     except Exception as e:
         error_message = f"Критическая ошибка во время автоматического бронирования (Шаг 12): {e}"
-        # ... остальной код ошибки ...   
+        print_timestamped(error_message)
+        await send_telegram_message(f"Критическая ошибка во время авто-бронирования: {e}", is_verbose=False)
+        path = await save_screenshot(page, "booking_error")
+        if path:
+            await send_telegram_photo(path, f"Ошибка на этапе бронирования.")
+        return f"Ошибка при бронировании: {e}"
 
 
 
