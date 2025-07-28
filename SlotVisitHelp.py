@@ -49,8 +49,8 @@ CONFIG = {
     'user_agent': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     'retry_count': 1,
     # ИЗМЕНЕНИЕ: Токен и ID чата теперь загружаются из файла .env
-    'telegram_bot_token': os.getenv('TELEGRAM_BOT_TOKEN'),
-    'telegram_chat_id': os.getenv('TELEGRAM_CHAT_ID'),
+    'telegram_bot_token': os.getenv('PROD_BOT_TOKEN'),
+    'telegram_chat_id': os.getenv('MY_TELEGRAM_ID'),
     'max_reload_attempts': 999999999,
     'reload_delay_seconds': 5,
     'post_search_delay_seconds': 3,
