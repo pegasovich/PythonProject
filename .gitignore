@@ -3,6 +3,8 @@
 /sessions_data/
 /active_keys_data/
 /user_data_archives/
+/browser_profile_193287726/
+/venv/
 
 # Папка со скриншотами (Сгенерированные файлы)
 /screenshots_data/
@@ -14,3 +16,28 @@ __pycache__/
 
 .env
 user_keys/193287726/Кривокобильський_О_О_monoКЕП (1).pfx
+bot_activity.log
+requirements.txt
+browser_profile_193287726/CrashpadMetrics-active.pma
+browser_profile_193287726/first_party_sets.db
+browser_profile_193287726/first_party_sets.db-journal
+browser_profile_193287726/Last Version
+browser_profile_193287726/Local State
+browser_profile_193287726/Variations
+browser_profile_193287726/BrowserMetrics/BrowserMetrics-688816B9-398.pma
+browser_profile_193287726/Crashpad/metadata
+browser_profile_193287726/Crashpad/settings.dat
+browser_profile_193287726/Default/Account Web Data
+browser_profile_193287726/Default/Account Web Data-journal
+browser_profile_193287726/Default/Affiliation Database
+browser_profile_193287726/Default/Affiliation Database-journal
+browser_profile_193287726/Default/BookmarkMergedSurfaceOrdering
+browser_profile_193287726/Default/Favicons
+browser_profile_193287726/Default/Favicons-journal
+browser_profile_193287726/Default/History
+browser_profile_193287726/Default/History-journal
+browser_profile_193287726/Default/LOCK
+browser_profile_193287726/Default/LOG
+browser_profile_193287726/Default/Login Data
+browser_profile_193287726/Default/Login Data For Account
+browser_profile_193287726/Default/Login Data For Account-journal
