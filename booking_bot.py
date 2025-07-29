@@ -497,9 +497,8 @@ async def update_lists_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 
-
 async def start_scraping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Запускает Playwright для сбора данных с максимальной маскировкой и паузами."""
+    """Запускает Playwright для сбора данных, работая с правильным типом выпадающего списка."""
     query = update.callback_query
     await query.answer()
     chat_id = query.message.chat.id
@@ -543,14 +542,25 @@ async def start_scraping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await page.wait_for_url("**/placeOfVisitInfo**", timeout=60000)
         
         await bot.send_message(chat_id, "Собираю список стран...")
-        country_input = page.locator('input[id="country"]')
-        await country_input.click()
         
-        # --- ИЗМЕНЕНИЕ: Ждем не контейнер, а первый элемент в списке ---
-        await expect(page.locator('ul[role="listbox"] li[role="option"]').first).to_be_visible(timeout=30000)
+        # --- ФИНАЛЬНОЕ ИЗМЕНЕНИЕ: Работаем со стандартным <select> списком ---
+        country_selector = 'select#country'
+        institution_selector = 'select#consularInstitution'
         
-        country_list_raw = await page.locator('ul[role="listbox"] li[role="option"]').all_text_contents()
-        country_list = sorted([c.strip() for c in country_list_raw if c.strip()])
+        # Ждем, пока элемент <select> для стран станет видимым
+        await expect(page.locator(country_selector)).to_be_visible(timeout=30000)
+        
+        # Получаем все опции из списка стран
+        country_options = await page.locator(f'{country_selector} > option').all()
+        country_list = []
+        for option in country_options:
+            text = await option.text_content()
+            value = await option.get_attribute('value')
+            if text and value: # Пропускаем пустые опции
+                country_list.append(text.strip())
+        
+        country_list = sorted(country_list)
+        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
         scraped_data = {'countries': country_list, 'institutions': {}}
 
@@ -558,36 +568,33 @@ async def start_scraping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         
         for i, country in enumerate(country_list):
             try:
-                await country_input.fill(country, delay=random.randint(50, 150))
-                await page.wait_for_timeout(random.randint(800, 1500))
-                await page.locator(f'li[role="option"]:has-text("{country}")').click()
-                await page.wait_for_timeout(random.randint(2000, 3500))
-
-                try:
-                    await page.locator('input[id="consularInstitution"]').click()
-                    # И здесь тоже ждем первый элемент, а не контейнер
-                    await expect(page.locator('ul[role="listbox"] li[role="option"]').first).to_be_visible(timeout=20000)
-                    institution_list_raw = await page.locator('ul[role="listbox"] li[role="option"]').all_text_contents()
-                    scraped_data['institutions'][country] = [inst.strip() for inst in institution_list_raw if inst.strip()]
-                    logging.info(f"Собраны учреждения для страны: {country}")
-                except PlaywrightTimeoutError:
-                    logging.warning(f"Для страны '{country}' не удалось загрузить список учреждений (таймаут). Вероятно, он пуст.")
-                    scraped_data['institutions'][country] = []
-
-                await country_input.clear()
+                # Выбираем страну в списке <select>
+                await page.locator(country_selector).select_option(label=country)
                 
-                pause_duration = random.randint(5, 15)
+                # Ждем появления списка учреждений (может быть небольшая задержка для загрузки)
+                await page.wait_for_timeout(3000)
+
+                # Получаем все опции из списка учреждений
+                institution_options = await page.locator(f'{institution_selector} > option').all()
+                institutions = []
+                for option in institution_options:
+                    text = await option.text_content()
+                    value = await option.get_attribute('value')
+                    if text and value:
+                        institutions.append(text.strip())
+                
+                scraped_data['institutions'][country] = institutions
+                logging.info(f"Собраны учреждения для страны: {country}")
+                
+                pause_duration = random.randint(3, 8) # Можно уменьшить паузу
                 logging.info(f"Обработано {i + 1}/{len(country_list)}: {country}. Пауза {pause_duration} секунд...")
                 await page.wait_for_timeout(pause_duration * 1000)
 
-                if (i + 1) % 5 == 0:
+                if (i + 1) % 10 == 0:
                     await bot.send_message(chat_id, f"Обработано {i + 1}/{len(country_list)} стран...")
             except Exception as e:
                 logging.error(f"Не удалось обработать страну '{country}': {e}. Пропускаю.")
-                await page.reload()
-                await page.wait_for_url("**/placeOfVisitInfo**", timeout=60000)
-                country_input = page.locator('input[id="country"]')
-
+        
         with open(DATA_FILE, 'w', encoding='utf-8') as f:
             json.dump(scraped_data, f, ensure_ascii=False, indent=4)
 
@@ -603,6 +610,9 @@ async def start_scraping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if browser_context: await browser_context.close()
         if p: await p.stop()
     return ConversationHandler.END
+
+
+
 
 
 
