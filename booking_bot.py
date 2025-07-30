@@ -37,7 +37,6 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv('DEV_BOT_TOKEN')
 OWNER_TELEGRAM_ID = os.getenv('OWNER_TELEGRAM_ID')
 WORKER_COUNT = 2
-# Папку с сессиями переименовали для ясности
 BASE_PROFILES_DIR = 'browser_profiles'
 BASE_SCREENSHOTS_DIR = 'screenshots_data'
 BASE_KEYS_DIR = 'user_keys'
@@ -55,23 +54,23 @@ class SessionResetException(Exception):
 
 # --- HELPER FUNCTIONS ---
 
-async def save_screenshot(page, name, chat_id, locator=None, full_page=False):
-    screenshots_dir = os.path.join(BASE_SCREENSHOTS_DIR, str(chat_id))
+async def save_screenshot(page, name, context_id, locator=None, full_page=False):
+    screenshots_dir = os.path.join(BASE_SCREENSHOTS_DIR, str(context_id))
     os.makedirs(screenshots_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = os.path.join(screenshots_dir, f"{name}_{timestamp}.png")
     try:
         if page.is_closed():
-            logging.warning(f"[Чат-{chat_id}] Не вдалося зберегти знімок екрана '{name}': сторінка вже закрита.")
+            logging.warning(f"[ID-{context_id}] Не вдалося зберегти знімок екрана '{name}': сторінка вже закрита.")
             return None
         if locator:
             await locator.screenshot(path=path)
         else:
             await page.screenshot(path=path, full_page=full_page)
-        logging.info(f"[Чат-{chat_id}] Знімок екрана збережено: {path}")
+        logging.info(f"[ID-{context_id}] Знімок екрана збережено: {path}")
         return path
     except Exception as e:
-        logging.error(f"[Чат-{chat_id}] Помилка при збереженні знімка екрана '{name}': {e}")
+        logging.error(f"[ID-{context_id}] Помилка при збереженні знімка екрана '{name}': {e}")
         return None
 
 async def send_telegram_photo(bot: Bot, chat_id: int, photo_path: str, caption=""):
@@ -85,8 +84,8 @@ async def send_telegram_photo(bot: Bot, chat_id: int, photo_path: str, caption="
     except Exception as e:
         logging.error(f"[Чат-{chat_id}] Помилка під час надсилання фото '{photo_path}': {e}")
 
-def load_user_data(chat_id: int) -> dict:
-    user_archive_dir = os.path.join(USER_DATA_ARCHIVES_DIR, str(chat_id))
+def load_user_data(user_id: int) -> dict:
+    user_archive_dir = os.path.join(USER_DATA_ARCHIVES_DIR, str(user_id))
     if not os.path.isdir(user_archive_dir):
         return {}
     try:
@@ -103,16 +102,16 @@ def load_user_data(chat_id: int) -> dict:
             else:
                 loaded_data.pop('key_file_path', None)
                 loaded_data.pop('key_file_name', None)
-        logging.info(f"Завантажено персональні дані для користувача {chat_id}")
+        logging.info(f"Завантажено персональні дані для користувача {user_id}")
         return loaded_data
     except Exception as e:
-        logging.error(f"Помилка при завантаженні даних для {chat_id}: {e}")
+        logging.error(f"Помилка при завантаженні даних для {user_id}: {e}")
         return {}
 
-async def save_user_data(chat_id: int, user_data: dict):
+async def save_user_data(user_id: int, user_data: dict):
     if not user_data:
         return
-    user_archive_dir = os.path.join(USER_DATA_ARCHIVES_DIR, str(chat_id))
+    user_archive_dir = os.path.join(USER_DATA_ARCHIVES_DIR, str(user_id))
     try:
         if os.path.isdir(user_archive_dir):
             shutil.rmtree(user_archive_dir)
@@ -124,9 +123,9 @@ async def save_user_data(chat_id: int, user_data: dict):
             json.dump(data_to_save, f, ensure_ascii=False, indent=4)
         if key_path_to_copy and os.path.exists(key_path_to_copy):
             shutil.copy(key_path_to_copy, user_archive_dir)
-        logging.info(f"Персональні дані для {chat_id} збережено.")
+        logging.info(f"Персональні дані для {user_id} збережено.")
     except Exception as e:
-        logging.error(f"Не вдалося зберегти дані для {chat_id}: {e}")
+        logging.error(f"Не вдалося зберегти дані для {user_id}: {e}")
 
 async def generate_year_selection_keyboard(base_year: int, original_month: int) -> InlineKeyboardMarkup:
     keyboard = [[InlineKeyboardButton("Виберіть рік", callback_data="calendar_ignore")]]
@@ -198,7 +197,7 @@ async def check_session_validity(page):
             return False
 
         logged_in_element_selector = page.get_by_role("link", name="Запис на візит")
-        await expect(logged_in_element_selector).to_be_visible(timeout=10000) # Збільшено таймаут
+        await expect(logged_in_element_selector).to_be_visible(timeout=10000)
         logging.info("Активний елемент навігації знайдено. Сесія дійсна.")
         return True
     except PlaywrightTimeoutError:
@@ -208,7 +207,7 @@ async def check_session_validity(page):
         logging.error(f"Помилка під час перевірки дійсності сесії: {e}")
         return False
 
-async def book_available_slot(page, bot, chat_id, log_func):
+async def book_available_slot(page, bot, user_id, chat_id, log_func):
     """Finds and books the first available slot."""
     log_func("Початок автоматичного бронювання слоту.")
     try:
@@ -232,7 +231,7 @@ async def book_available_slot(page, bot, chat_id, log_func):
                 continue
             log_func(f"!!! Знайдено тиждень з вільними слотами в місяці '{month_name}'!!!")
             week_block = available_week_locator.first
-            path = await save_screenshot(page, f"week_with_slots_{month_name}", chat_id)
+            path = await save_screenshot(page, f"week_with_slots_{month_name}", user_id)
             await send_telegram_photo(bot, chat_id, path, f"Знайдено тиждень зі слотами в {month_name}.")
             await week_block.click(timeout=15000)
             await page.wait_for_load_state('networkidle', timeout=30000)
@@ -256,7 +255,7 @@ async def book_available_slot(page, bot, chat_id, log_func):
             confirm_button_selector = 'button#finish-button'
             await page.locator(confirm_button_selector).wait_for(state='visible', timeout=15000)
             log_func("Натискаю кнопку 'Підтвердити'...")
-            path = await save_screenshot(page, "final_confirmation", chat_id)
+            path = await save_screenshot(page, "final_confirmation", user_id)
             await send_telegram_photo(bot, chat_id, path, "Екран перед фінальним підтвердженням.")
             await page.locator(confirm_button_selector).click()
             success_locator = page.locator('text="Ваш візит успішно заброньовано"')
@@ -264,7 +263,7 @@ async def book_available_slot(page, bot, chat_id, log_func):
             final_message = "!!! УСПІХ: Візит успішно заброньовано! Перевірте пошту та сторінку 'Мої візити'."
             log_func(final_message)
             await bot.send_message(chat_id, f"🎉 **УСПІХ!** 🎉\n{final_message}")
-            path = await save_screenshot(page, "booking_confirmed", chat_id)
+            path = await save_screenshot(page, "booking_confirmed", user_id)
             await send_telegram_photo(bot, chat_id, path, "Візит успішно заброньовано!")
             return "Успішне автоматичне бронювання."
         log_func("Пошук завершено. Немає вільних слотів для бронювання.")
@@ -273,15 +272,16 @@ async def book_available_slot(page, bot, chat_id, log_func):
         error_message = f"Критична помилка під час автоматичного бронювання: {e}"
         log_func(error_message)
         await bot.send_message(chat_id, f"❗️ Помилка під час бронювання: {e}")
-        path = await save_screenshot(page, "booking_error", chat_id)
+        path = await save_screenshot(page, "booking_error", user_id)
         await send_telegram_photo(bot, chat_id, path, "Помилка на етапі бронювання.")
         raise SessionResetException(f"Помилка під час бронювання: {e}")
 
-async def run_booking_session(bot: Bot, chat_id: int, user_data: dict, worker_id: int, headless_mode: bool):
+async def run_booking_session(bot: Bot, user_id: int, user_data: dict, worker_id: int, headless_mode: bool):
     """Main worker function to perform the booking using a persistent profile."""
     p = context = page = None
-    log_func = lambda msg: logging.info(f"[Воркер-{worker_id}][Чат-{chat_id}] {msg}")
-    user_data_dir = os.path.join(BASE_PROFILES_DIR, f"profile_{chat_id}")
+    chat_id = user_data['chat_id']
+    log_func = lambda msg: logging.info(f"[Воркер-{worker_id}][Користувач-{user_id}] {msg}")
+    user_data_dir = os.path.join(BASE_PROFILES_DIR, f"profile_{user_id}")
 
     try:
         log_func("="*20 + " ПОЧАТОК НОВОЇ СЕСІЇ " + "="*20)
@@ -296,7 +296,6 @@ async def run_booking_session(bot: Bot, chat_id: int, user_data: dict, worker_id
             locale="uk-UA",
             timezone_id="Europe/Kiev",
             viewport=None,
-            # Таймаут для запуску браузера
             timeout=90000 
         )
         
@@ -323,7 +322,7 @@ async def run_booking_session(bot: Bot, chat_id: int, user_data: dict, worker_id
                 await page.wait_for_timeout(3000) 
                 qr_element = page.locator("canvas, div.qr-code").first
                 await qr_element.wait_for(state='visible', timeout=60000)
-                qr_path = await save_screenshot(page, "diia_qr_code", chat_id, locator=qr_element)
+                qr_path = await save_screenshot(page, "diia_qr_code", user_id, locator=qr_element)
                 await send_telegram_photo(bot, chat_id, qr_path, "Відскануйте QR-код у застосунку 'Дія' для авторизації.")
                 await bot.send_message(chat_id, "Очікую підтвердження в 'Дія'. У вас є 3 хвилини.")
                 await page.wait_for_url("**/e-consul.gov.ua/**", timeout=180000)
@@ -348,7 +347,7 @@ async def run_booking_session(bot: Bot, chat_id: int, user_data: dict, worker_id
                 await page.wait_for_timeout(3000)
                 qr_element = page.locator("#qr-overlay, div.qr-code, canvas").first
                 await qr_element.wait_for(state='visible', timeout=60000)
-                qr_path = await save_screenshot(page, "bankid_qr_code", chat_id, locator=qr_element)
+                qr_path = await save_screenshot(page, "bankid_qr_code", user_id, locator=qr_element)
                 await send_telegram_photo(bot, chat_id, qr_path, "Відскануйте QR-код у додатку Monobank.")
                 await page.wait_for_url("**/id.gov.ua/bankid-auth-callback**", timeout=180000)
                 async with page.expect_navigation(url="**/e-consul.gov.ua/**"):
@@ -413,7 +412,7 @@ async def run_booking_session(bot: Bot, chat_id: int, user_data: dict, worker_id
             if await page.locator('div[class*="scrollbar-container"]').is_visible():
                 log_func("!!! КАЛЕНДАР ЗНАЙДЕНО! Слоти доступні !!!")
                 await bot.send_message(chat_id, "🔥 **ЗНАЙДЕНО СЛОТИ!** 🔥\nПочинаю бронювання...")
-                result = await book_available_slot(page, bot, chat_id, log_func)
+                result = await book_available_slot(page, bot, user_id, chat_id, log_func)
                 if "Успішне" in result:
                     return
                 else:
@@ -433,7 +432,7 @@ async def run_booking_session(bot: Bot, chat_id: int, user_data: dict, worker_id
         logging.error("\nПОВНИЙ ТРЕЙСБЕК ПОМИЛКИ:\n" + full_traceback)
         await bot.send_message(chat_id, f"❗️ **Сталася помилка у воркері.**\n\n`{str(e)}`\n\nЗавдання буде перезапущено.")
         if page and not page.is_closed():
-            await save_screenshot(page, "error_screenshot", chat_id)
+            await save_screenshot(page, "error_screenshot", user_id)
         raise SessionResetException(f"Критична помилка: {e}")
     finally:
         if context: await context.close()
@@ -446,45 +445,46 @@ async def worker(worker_id: int, app: Application, headless_mode: bool):
     logging.info(f"[Воркер-{worker_id}] запущений.")
     while True:
         try:
-            chat_id = await task_queue.get()
-            logging.info(f"[Воркер-{worker_id}] Взяв у роботу користувача {chat_id}.")
-            user_data = user_sessions.get(chat_id)
+            user_id = await task_queue.get()
+            logging.info(f"[Воркер-{worker_id}] Взяв у роботу користувача {user_id}.")
+            user_data = user_sessions.get(user_id)
             if not user_data or user_data.get('status') != 'ready':
-                logging.warning(f"[Воркер-{worker_id}] Дані для {chat_id} не знайдено, завдання пропущено.")
+                logging.warning(f"[Воркер-{worker_id}] Дані для {user_id} не знайдено, завдання пропущено.")
                 task_queue.task_done()
                 continue
             
             max_restarts = 5
+            chat_id = user_data['chat_id']
             for attempt in range(max_restarts):
                 try:
-                    await run_booking_session(app.bot, chat_id, user_data, worker_id, headless_mode)
-                    logging.info(f"[Воркер-{worker_id}] Завдання для {chat_id} успішно виконано.")
+                    await run_booking_session(app.bot, user_id, user_data, worker_id, headless_mode)
+                    logging.info(f"[Воркер-{worker_id}] Завдання для {user_id} успішно виконано.")
                     break 
                 except SessionResetException as e:
-                    logging.warning(f"[Воркер-{worker_id}] Перезапуск сесії для {chat_id} (спроба {attempt + 1}/{max_restarts}). Причина: {e}")
+                    logging.warning(f"[Воркер-{worker_id}] Перезапуск сесії для {user_id} (спроба {attempt + 1}/{max_restarts}). Причина: {e}")
                     if attempt + 1 >= max_restarts:
-                        logging.error(f"Досягнуто ліміту перезапусків для {chat_id}. Завдання зупинено.")
+                        logging.error(f"Досягнуто ліміту перезапусків для {user_id}. Завдання зупинено.")
                         await app.bot.send_message(chat_id, "Досягнуто ліміту автоматичних перезапусків. Завдання зупинено.")
                         break
                     await asyncio.sleep(15)
 
-            logging.info(f"[Воркер-{worker_id}] Завершив роботу з користувачем {chat_id}.")
-            if chat_id in user_sessions:
-                del user_sessions[chat_id]
+            logging.info(f"[Воркер-{worker_id}] Завершив роботу з користувачем {user_id}.")
+            if user_id in user_sessions:
+                del user_sessions[user_id]
             task_queue.task_done()
         except Exception as e:
             logging.critical(f"Критична помилка у воркері {worker_id}: {e}")
 
 async def update_lists_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user_id = str(update.effective_user.id)
-    owner_id = os.getenv('OWNER_TELEGRAM_ID')
+    user_id = update.effective_user.id
+    owner_id_str = os.getenv('OWNER_TELEGRAM_ID')
 
-    if not owner_id:
+    if not owner_id_str:
         await update.message.reply_text("❗️ Команду не налаштовано: ID адміністратора не вказано.")
         logging.warning(f"Користувач {user_id} намагався виконати /update_lists, але OWNER_TELEGRAM_ID не встановлено.")
         return ConversationHandler.END
 
-    if user_id != owner_id:
+    if user_id != int(owner_id_str):
         await update.message.reply_text("🚫 У вас немає прав для виконання цієї команди.")
         logging.warning(f"Користувач {user_id} (не адмін) намагався виконати /update_lists.")
         return ConversationHandler.END
@@ -498,16 +498,20 @@ async def update_lists_command(update: Update, context: ContextTypes.DEFAULT_TYP
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Почати", callback_data="start_scraping")]])
     )
     return UPDATING_LISTS
+# ... (Остальная часть скрипта остается без изменений)
 
 async def start_scraping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Збирає списки країн, установ та послуг, з періодичним перезавантаженням сторінки."""
+    """
+    Собирает списки учреждений и услуг, ИСПОЛЬЗУЯ ГОТОВЫЙ СПИСОК СТРАН из файла.
+    ФИНАЛЬНАЯ ВЕРСИЯ 3.1: Улучшен переход к сбору услуг.
+    """
     query = update.callback_query
     await query.answer()
     chat_id = query.message.chat.id
-    bot = context.bot
+    user_id = query.from_user.id
     
-    user_data_dir = os.path.join(BASE_PROFILES_DIR, f"profile_{chat_id}")
-    await query.edit_message_text(f"Запускаю браузер з постійним профілем...")
+    user_data_dir = os.path.join(BASE_PROFILES_DIR, f"profile_{user_id}_admin")
+    await query.edit_message_text("Запускаю браузер з профілем адміністратора...")
 
     p = browser_context = page = None
     try:
@@ -524,216 +528,148 @@ async def start_scraping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         logging.info("Маскування navigator.webdriver застосовано.")
         
         await page.goto("https://e-consul.gov.ua/", timeout=60000, wait_until="domcontentloaded")
-        await bot.send_message(chat_id, 
+        await context.bot.send_message(chat_id, 
             "Браузер запущено. Будь ласка, увійдіть до свого облікового запису на сайті e-consul.\n"
-            "У вас є 5 хвилин. Після успішного входу, поверніться сюди.")
+            "Після успішного входу, поверніться сюди.")
 
         await page.wait_for_url("**/messages**", timeout=300000)
-        await bot.send_message(chat_id, "✅ Авторизація пройдена. Починаю збір даних...")
+        await context.bot.send_message(chat_id, "✅ Авторизація пройдена. Починаю збір даних...")
         
-        async def navigate_to_country_form():
-            """Надійна допоміжна функція для навігації до форми вибору країни."""
-            try:
-                if "placeOfVisitInfo" in page.url:
-                    logging.info("Вже знаходимось на сторінці 'Місце візиту'. Пропускаю навігацію.")
-                    await page.locator('input[id="country"]').wait_for(state='visible', timeout=15000)
-                    return
+        logging.info("Перехід до форми вибору країни...")
+        await page.get_by_role("link", name="Запис на візит").click()
+        await page.get_by_role("link", name="Записатись на візит").click()
+        await page.wait_for_url("**/applicantInfo**", timeout=60000)
+        await page.locator('input[aria-label="день"]').fill("1")
+        await page.locator('div[aria-label="місяць"]').click()
+        await page.get_by_role("option", name="січня").click()
+        await page.locator('input[aria-label="рік"]').fill("2000")
+        await page.get_by_label("Жіноча").check()
+        await page.get_by_role("button", name="Далі").click()
+        await page.wait_for_url("**/placeOfVisitInfo**", timeout=60000)
+        logging.info("Успішно перейшли до форми вибору країни.")
 
-                logging.info("Перехід до форми вибору країни...")
-                visit_link_locator = page.get_by_role("link", name="Запис на візит")
-                await visit_link_locator.wait_for(state="visible", timeout=30000)
-                await visit_link_locator.click()
+        await context.bot.send_message(chat_id, f"Етап 1: Читаю список країн з файлу `{DATA_FILE}`...")
+        try:
+            with open(DATA_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                country_list = data['countries']
+            if not country_list:
+                raise Exception("Список країн у файлі порожній.")
+            logging.info(f"Успішно завантажено {len(country_list)} країн з файлу.")
+            await context.bot.send_message(chat_id, f"✅ Список з {len(country_list)} країн завантажено.")
+        except Exception as e:
+            await context.bot.send_message(chat_id, f"❗️ Помилка читання файлу `{DATA_FILE}`: {e}. Оновлення неможливе.")
+            raise
 
-                book_visit_locator = page.get_by_role("link", name="Записатись на візит")
-                await book_visit_locator.wait_for(state="visible", timeout=30000)
-                await book_visit_locator.click()
-
-                await page.wait_for_url("**/applicantInfo**", timeout=60000)
-                await page.locator('input[aria-label="день"]').fill("1")
-                await page.locator('div[aria-label="місяць"]').click()
-                await page.get_by_role("option", name="січня").click()
-                await page.locator('input[aria-label="рік"]').fill("2000")
-                await page.get_by_label("Жіноча").check()
-                await page.get_by_role("button", name="Далі").click()
-                
-                await page.wait_for_url("**/placeOfVisitInfo**", timeout=60000)
-                logging.info("Успішно перейшли до форми вибору країни.")
-            except PlaywrightTimeoutError as e:
-                logging.error(f"Таймаут під час навігації: {str(e).splitlines()[0]}")
-                
-                try:
-                    await bot.send_message(chat_id, "❗️ **Помилка:** Не вдалося знайти ключовий елемент навігації. Спробую зібрати діагностичну інформацію...")
-                    
-                    html_content = await page.content()
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    debug_dir = os.path.join(BASE_SCREENSHOTS_DIR, str(chat_id))
-                    os.makedirs(debug_dir, exist_ok=True)
-                    html_path = os.path.join(debug_dir, f"debug_page_{timestamp}.html")
-                    with open(html_path, 'w', encoding='utf-8') as f:
-                        f.write(html_content)
-                    
-                    with open(html_path, 'rb') as html_file:
-                        await bot.send_document(chat_id=chat_id, document=html_file, caption="HTML-код сторінки в момент помилки.")
-                    logging.info(f"Надіслано файл з HTML-кодом: {html_path}")
-                    os.remove(html_path)
-
-                    path = await save_screenshot(page, "navigation_failed", chat_id)
-                    await send_telegram_photo(bot, chat_id, path, caption="Знімок екрана в момент помилки.")
-
-                except Exception as report_error:
-                    logging.error(f"!!! Не вдалося надіслати діагностичний звіт: {report_error}")
-                    try:
-                        await bot.send_message(chat_id, "❗️ **Помилка:** Не вдалося знайти ключовий елемент. Спроба надіслати діагностичні файли також не вдалася, ймовірно, через проблеми з мережею.")
-                    except Exception as final_report_error:
-                        logging.error(f"!!! Не вдалося надіслати навіть фінальне повідомлення про помилку: {final_report_error}")
-
-                raise SessionResetException("Помилка навігації, потрібно перезапустити.")
-
-        await navigate_to_country_form()
-        
-        await bot.send_message(chat_id, "Етап 1: Збираю повний список країн...")
-        
-        country_input_selector = 'input[id="country"]'
-        institution_input_selector = 'input[id="consularInstitution"]'
-        options_selector = 'div[class*="MuiAutocomplete-popper"] li.MuiAutocomplete-option'
-
-        await page.locator(country_input_selector).click()
-        await page.locator(options_selector).first.wait_for(state='visible', timeout=15000)
-        
-        found_countries = set()
-        no_new_countries_streak = 0
-        for i in range(200):
-            current_options = await page.locator(options_selector).all()
-            initial_count = len(found_countries)
-            for option in current_options:
-                text = await option.text_content()
-                if text: found_countries.add(text.strip())
-            if len(found_countries) > initial_count: no_new_countries_streak = 0
-            else: no_new_countries_streak += 1
-            if no_new_countries_streak >= 15: break
-            await page.locator(country_input_selector).press("ArrowDown")
-            await page.wait_for_timeout(50)
-        country_list = sorted(list(found_countries))
-        await page.locator('body').click()
-        await page.wait_for_timeout(500)
-
-        logging.info("Список країн зібрано. Перезавантажую сторінку для стабілізації перед основною обробкою.")
-        await bot.send_message(chat_id, f"✅ Список з {len(country_list)} країн отримано. Етап 2: Оновлюю сторінку для стабільної роботи...")
-        
-        await page.reload(wait_until="domcontentloaded", timeout=60000)
-        
-        await navigate_to_country_form()
-
+        await context.bot.send_message(chat_id, "Етап 2: Отримую списки консульств для кожної країни...")
         scraped_data = {'countries': country_list, 'institutions': {}}
-        await bot.send_message(chat_id, f"Етап 3: Починаю збір консульств для кожної країни...")
+        country_input = page.locator('input[id="country"]')
+        institution_input = page.locator('input[id="consularInstitution"]')
         
-        for i, country in enumerate(country_list):
+        last_successful_country = None
+        
+        for i, country_name in enumerate(country_list):
             try:
-                if (i > 0) and (i % 5 == 0):
-                    logging.info(f"--- Періодичне перезавантаження сторінки після обробки {i} країн ---")
-                    await bot.send_message(chat_id, f"⚙️ Оновлюю сесію для стабільності (оброблено {i}/{len(country_list)})...")
-                    
-                    await page.reload(wait_until="domcontentloaded", timeout=60000)
-                    
-                    await navigate_to_country_form()
-                    logging.info("--- Сторінку перезавантажено, продовжую збір ---")
-
-                country_input = page.locator(country_input_selector)
-                await country_input.wait_for(state='visible', timeout=15000)
-                await country_input.clear()
-                await page.locator(institution_input_selector).clear()
+                await country_input.fill(country_name, timeout=10000)
                 await page.wait_for_timeout(500)
-
-                await country_input.fill(country)
-                await page.get_by_role("option", name=country, exact=True).click(timeout=10000)
+                await country_input.press("ArrowDown")
+                await page.wait_for_timeout(200)
+                await country_input.press("Enter")
                 
-                await page.locator(institution_input_selector).click()
-                await page.locator(options_selector).first.wait_for(state='visible', timeout=10000)
-                inst_locators = page.locator(options_selector)
-                institutions = [await loc.text_content() for loc in await inst_locators.all()]
-                scraped_data['institutions'][country] = sorted(institutions)
-                logging.info(f"({i + 1}/{len(country_list)}) Зібрано установи для: {country}")
-                await page.locator('body').click()
-                await page.wait_for_timeout(random.randint(1000, 1500))
-
-                if (i + 1) % 15 == 0 and (i+1) % 5 != 0:
-                    await bot.send_message(chat_id, f"Оброблено {i + 1}/{len(country_list)} країн...")
-            
-            except PlaywrightTimeoutError as e:
-                error_msg_text = str(e)
-                logging.error(f"Не вдалося обробити країну '{country}' через таймаут: {error_msg_text.splitlines()[0]}. Пропускаю і спробую перезавантажити сторінку.")
+                await expect(institution_input).to_be_enabled(timeout=5000)
+                
+                institutions = []
                 try:
-                    await bot.send_message(chat_id, f"❗️ Схоже, сторінка 'зависла' на країні '{country}'. Перезавантажую, щоб продовжити...")
-                    await page.reload(wait_until="domcontentloaded", timeout=60000)
-                    await navigate_to_country_form()
-                except Exception as recovery_err:
-                    logging.error(f"Критична помилка під час спроби відновлення: {recovery_err}")
-                    await bot.send_message(chat_id, "❗️ Не вдалося відновити роботу після збою. Зупиняю процес.")
-                    raise SessionResetException("Невдала спроба відновлення.")
-                continue
+                    await institution_input.click(force=True, timeout=5000)
+                    institution_options_locator = page.locator('div[class*="MuiAutocomplete-popper"] li.MuiAutocomplete-option')
+                    await institution_options_locator.first.wait_for(state='visible', timeout=10000)
+                    institutions = sorted(await institution_options_locator.all_text_contents())
+                    await page.locator('body').click()
+                except PlaywrightTimeoutError:
+                    logging.info(f"Для країни '{country_name}' установ не знайдено (таймаут очікування списку). Пропускаю.")
+                    institutions = []
+                
+                scraped_data['institutions'][country_name] = institutions
+                if institutions:
+                    last_successful_country = {"name": country_name, "institution": institutions[0]}
+
+                logging.info(f"({i + 1}/{len(country_list)}) Зібрано {len(institutions)} установ для: {country_name}")
+
+                await institution_input.clear() 
+                await country_input.clear()
+
+                if (i + 1) % 25 == 0:
+                    await context.bot.send_message(chat_id, f"Оброблено {i + 1}/{len(country_list)} країн...")
 
             except Exception as e:
-                error_msg_text = str(e)
-                logging.error(f"Не вдалося обробити країну '{country}': {error_msg_text.splitlines()[0]}. Пропускаю.")
-                if "browser has been closed" in error_msg_text:
-                    logging.critical("Браузер було закрито. Припиняю збір даних.")
-                    await bot.send_message(chat_id, "❗️ **Критична помилка**: Браузер несподівано закрився. Процес збору зупинено.")
-                    break
+                logging.error(f"Не вдалося обробити країну '{country_name}': {e}. Пропускаю.")
+                await page.reload(wait_until="domcontentloaded")
+                await page.wait_for_url("**/placeOfVisitInfo**", timeout=60000)
+                country_input = page.locator('input[id="country"]')
+                institution_input = page.locator('input[id="consularInstitution"]')
+
+        await context.bot.send_message(chat_id, "Етап 3: Отримую повний список послуг...")
         
-        if not browser_context.is_closed():
-            await bot.send_message(chat_id, "Збір установ завершено. Переходжу до збору списку послуг...")
-            first_country_with_inst = next((c for c in country_list if scraped_data['institutions'].get(c)), None)
-            if not first_country_with_inst:
-                raise Exception("Не вдалося знайти жодної країни з установами для продовження.")
-            first_institution = scraped_data['institutions'][first_country_with_inst][0]
+        next_button = page.get_by_role("button", name="Далі")
+        if not await next_button.is_enabled():
+            logging.warning("Кнопка 'Далі' неактивна. Спроба 'розбудити' сторінку, вибравши останню країну.")
+            if last_successful_country:
+                await country_input.fill(last_successful_country["name"])
+                await page.get_by_role("option", name=last_successful_country["name"], exact=True).click()
+                await expect(institution_input).to_be_enabled(timeout=10000)
+                await institution_input.fill(last_successful_country["institution"])
+                await page.get_by_role("option", name=last_successful_country["institution"], exact=True).click()
+                await expect(next_button).to_be_enabled(timeout=10000)
+            else:
+                raise Exception("Кнопка 'Далі' неактивна, і немає даних для її активації.")
+
+        await next_button.click()
+        await page.wait_for_url("**/consularServiceInfo**", timeout=60000)
+        
+        service_input = page.locator('input[id="service"]')
+        await service_input.click(timeout=10000)
+        await page.get_by_role("option").first.wait_for(state='visible', timeout=15000)
+        
+        found_services = set()
+        no_new_services_streak = 0
+        for _ in range(250):
+            current_options = await page.get_by_role("option").all()
+            initial_count = len(found_services)
+            for option in current_options:
+                text = await option.text_content()
+                if text:
+                    found_services.add(text.strip())
             
-            await page.locator(country_input_selector).fill(first_country_with_inst)
-            await page.get_by_role("option", name=first_country_with_inst, exact=True).click()
-            await page.wait_for_timeout(500)
-            await page.locator(institution_input_selector).fill(first_institution)
-            await page.get_by_role("option", name=first_institution, exact=True).click()
-            await page.get_by_role("button", name="Далі").click()
-            await page.wait_for_url("**/consularServiceInfo**", timeout=60000)
+            if len(found_services) > initial_count:
+                no_new_services_streak = 0
+            else:
+                no_new_services_streak += 1
             
-            await bot.send_message(chat_id, "На сторінці вибору послуг. Починаю збір з прокруткою...")
-            service_input_selector = 'input[id="service"]'
-            await page.locator(service_input_selector).click(timeout=10000)
-            await page.get_by_role("option").first.wait_for(state='visible', timeout=15000)
-            
-            found_services = set()
-            no_new_services_streak = 0
-            for i in range(200):
-                current_options = await page.locator(options_selector).all()
-                initial_count = len(found_services)
-                for option in current_options:
-                    text = await option.text_content()
-                    if text: found_services.add(text.strip())
-                if len(found_services) > initial_count: no_new_services_streak = 0
-                else: no_new_services_streak += 1
-                if no_new_services_streak >= 15: break
-                await page.locator(service_input_selector).press("ArrowDown")
-                await page.wait_for_timeout(50)
+            if no_new_services_streak >= 15:
+                logging.info("Прокрутка завершена: список послуг перестав оновлюватися.")
+                break
                 
-            all_available_services = sorted(list(found_services))
-            scraped_data['services'] = all_available_services
-            logging.info(f"Успішно зібрано {len(all_available_services)} унікальних послуг.")
+            await service_input.press("ArrowDown")
+            await page.wait_for_timeout(50)
+        
+        all_available_services = sorted(list(found_services))
+        scraped_data['services'] = all_available_services
+        logging.info(f"Успішно зібрано {len(all_available_services)} унікальних послуг.")
+        
+        with open(DATA_FILE, 'w', encoding='utf-8') as f:
+            json.dump(scraped_data, f, ensure_ascii=False, indent=4)
 
-            with open(DATA_FILE, 'w', encoding='utf-8') as f:
-                json.dump(scraped_data, f, ensure_ascii=False, indent=4)
+        await context.bot.send_message(chat_id, f"🎉 **Готово!**\nДовідники успішно оновлено.\n"
+                                        f"Використано країн з файлу: {len(country_list)}\n"
+                                        f"Знайдено країн з установами: {len(scraped_data['institutions'])}\n"
+                                        f"Знайдено консульських послуг: {len(all_available_services)}")
 
-            await bot.send_message(chat_id, f"🎉 **Готово!**\nДовідники успішно оновлено.\n"
-                                            f"Знайдено країн з установами: {len(scraped_data['institutions'])}/{len(country_list)}\n"
-                                            f"Знайдено консульських послуг: {len(all_available_services)}")
-    except PlaywrightTimeoutError as e:
-        error_text = str(e).splitlines()[0]
-        logging.error(f"Стався таймаут на одному з кроків: {error_text}")
-        await bot.send_message(chat_id, f"❗️ **Помилка таймауту:**\n`{error_text}`")
-        if page and not page.is_closed():
-            path = await save_screenshot(page, "timeout_error", chat_id)
-            await send_telegram_photo(bot, chat_id, path, caption="Знімок екрана в момент помилки")
     except Exception as e:
         logging.error(f"Сталася критична помилка в start_scraping: {e}", exc_info=True)
-        await bot.send_message(chat_id, f"❗️ Сталася критична помилка: {str(e).splitlines()[0]}")
+        if page and not page.is_closed():
+             path = await save_screenshot(page, "critical_scraping_error", user_id)
+             await send_telegram_photo(context.bot, chat_id, path, "Критична помилка під час збору даних")
+        await context.bot.send_message(chat_id, f"❗️ Сталася критична помилка: {str(e).splitlines()[0]}")
     finally:
         if browser_context: await browser_context.close()
         if p: await p.stop()
@@ -758,20 +694,21 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text("👋 **Привіт!**\n\nЯ бот для запису на консульські послуги. Використовуйте /menu або /keyboard для початку.")
 
 async def start_new_booking_flow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """General function to start a new setup."""
+    user_id = update.effective_user.id
     chat_id = update.effective_chat.id
-    if chat_id in list(task_queue._queue) or (user_sessions.get(chat_id) and user_sessions[chat_id].get('status') == 'ready'):
+    
+    if user_id in list(task_queue._queue) or (user_sessions.get(user_id) and user_sessions[user_id].get('status') == 'ready'):
         await context.bot.send_message(chat_id, "❗️ Ваше завдання вже в черзі. Для скасування використовуйте /cancel.")
         return ConversationHandler.END
     
-    user_sessions[chat_id] = {'chat_id': chat_id}
+    user_sessions[user_id] = {'user_id': user_id, 'chat_id': chat_id}
     keyboard = [
         [InlineKeyboardButton("Дія.Підпис", callback_data='diia')],
         [InlineKeyboardButton("Особистий ключ (файл)", callback_data='key')],
         [InlineKeyboardButton("ID.GOV.UA (BankID)", callback_data='idgov')],
     ]
-    await context.bot.send_message(
-        chat_id,
+    message_source = update.callback_query.message if update.callback_query else update.message
+    await message_source.reply_text(
         "**Крок 1/5: Метод входу**\n\nВиберіть метод автентифікації:",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
@@ -782,7 +719,6 @@ async def book_new_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     return await start_new_booking_flow(update, context)
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Displays the main interactive menu."""
     message_source = update.callback_query.message if update.callback_query else update.message
     keyboard = [
         [InlineKeyboardButton("📝 Почати новий запис", callback_data="main_book_new")],
@@ -795,7 +731,6 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     return MAIN_MENU
 
 async def main_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handles main menu button presses."""
     query = update.callback_query
     await query.answer()
     
@@ -809,28 +744,34 @@ async def main_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 async def book_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     logging.info(f"Користувач {get_user_info(update)} виконав команду /book")
+    user_id = update.effective_user.id
     chat_id = update.effective_chat.id
-    if chat_id in list(task_queue._queue) or (user_sessions.get(chat_id) and user_sessions[chat_id].get('status') == 'ready'):
+
+    if user_id in list(task_queue._queue) or (user_sessions.get(user_id) and user_sessions[user_id].get('status') == 'ready'):
         await update.message.reply_text("❗️ Ваше завдання вже в черзі. Для скасування використовуйте /cancel.")
         return ConversationHandler.END
-    persisted_data = load_user_data(chat_id)
+        
+    persisted_data = load_user_data(user_id)
     if not persisted_data:
         await update.message.reply_text("Збережені дані не знайдено. Починаю нове налаштування...")
         return await start_new_booking_flow(update, context)
     
-    user_sessions[chat_id] = persisted_data
-    user_sessions[chat_id]['status'] = 'ready'
-    await task_queue.put(chat_id)
-    logging.info(f"Користувач {chat_id} доданий до черги зі збереженими даними.")
+    user_sessions[user_id] = persisted_data
+    user_sessions[user_id]['user_id'] = user_id
+    user_sessions[user_id]['chat_id'] = chat_id
+    user_sessions[user_id]['status'] = 'ready'
+    await task_queue.put(user_id)
+    logging.info(f"Користувач {user_id} доданий до черги зі збереженими даними.")
     await update.message.reply_text("✅ **Використовую збережені дані.**\nЗавдання додано до черги.")
     return ConversationHandler.END
 
 async def select_auth_method(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
+    user_id = query.from_user.id
     chat_id = query.message.chat.id
     auth_method = query.data
-    user_sessions[chat_id]['auth_method'] = auth_method
+    user_sessions[user_id]['auth_method'] = auth_method
     await query.edit_message_text(text=f"Вибраний метод: **{auth_method.upper()}**.")
     if auth_method == 'key':
         await context.bot.send_message(chat_id, "Прикріпіть ваш файл ключа (`.dat`, `.pfx`, тощо).")
@@ -843,21 +784,23 @@ async def select_auth_method(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return AWAITING_DOB_GENDER
 
 async def receive_key_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     document = update.message.document
-    keys_dir = os.path.join(BASE_KEYS_DIR, str(chat_id))
+    keys_dir = os.path.join(BASE_KEYS_DIR, str(user_id))
     os.makedirs(keys_dir, exist_ok=True)
     file_path = os.path.join(keys_dir, document.file_name)
     file = await document.get_file()
     await file.download_to_drive(file_path)
-    user_sessions[chat_id]['key_file_path'] = file_path
-    user_sessions[chat_id]['key_file_name'] = document.file_name
+    user_sessions[user_id]['key_file_path'] = file_path
+    user_sessions[user_id]['key_file_name'] = document.file_name
     await update.message.reply_text("✅ Файл отримано. Тепер введіть пароль до цього ключа.")
     return AWAITING_PASSWORD
 
 async def receive_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
     chat_id = update.effective_chat.id
-    user_sessions[chat_id]['key_password'] = update.message.text
+    user_sessions[user_id]['key_password'] = update.message.text
     try:
         await context.bot.delete_message(chat_id=chat_id, message_id=update.message.message_id)
         await update.message.reply_text("Пароль отримано та видалено.")
@@ -872,8 +815,8 @@ async def receive_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def select_gender(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    chat_id = query.message.chat.id
-    user_sessions[chat_id]['gender'] = query.data.split('_')[1]
+    user_id = query.from_user.id
+    user_sessions[user_id]['gender'] = query.data.split('_')[1]
     now = datetime.now()
     await query.edit_message_text("Стать обрано. Тепер виберіть вашу дату народження:", 
                                   reply_markup=await generate_calendar_keyboard(now.year, now.month))
@@ -882,6 +825,7 @@ async def select_gender(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 async def calendar_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
+    user_id = query.from_user.id
     chat_id = query.message.chat.id
     action, *params = query.data.split('_')
     if action != "calendar":
@@ -903,7 +847,7 @@ async def calendar_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         year, month, day = map(int, params[1:])
         if day == 0: return AWAITING_DOB_CALENDAR
         selected_date_str = f"{day:02d}.{month:02d}.{year}"
-        user_sessions[chat_id]['date_of_birth'] = selected_date_str
+        user_sessions[user_id]['date_of_birth'] = selected_date_str
         await query.edit_message_text(f"Обрана дата: {selected_date_str}")
         
         try:
@@ -918,8 +862,8 @@ async def calendar_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         main_countries = [c for c in main_countries_def if c in all_countries]
         other_countries = sorted([c for c in all_countries if c not in main_countries])
 
-        context.chat_data['main_countries'] = main_countries
-        context.chat_data['other_countries'] = other_countries
+        context.user_data['main_countries'] = main_countries
+        context.user_data['other_countries'] = other_countries
         
         keyboard = [[InlineKeyboardButton(country, callback_data=f"country_{country}")] for country in main_countries]
         if other_countries:
@@ -933,6 +877,7 @@ async def calendar_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def select_country(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
+    user_id = query.from_user.id
     chat_id = query.message.chat.id
     page_size = 8
     
@@ -952,28 +897,28 @@ async def select_country(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return InlineKeyboardMarkup(keyboard)
 
     if query.data == "show_other_countries":
-        context.chat_data['other_countries_page'] = 0
-        await query.edit_message_reply_markup(reply_markup=get_paginated_menu(context.chat_data['other_countries'], 0, "other_countries", "show_main_countries"))
+        context.user_data['other_countries_page'] = 0
+        await query.edit_message_reply_markup(reply_markup=get_paginated_menu(context.user_data['other_countries'], 0, "other_countries", "show_main_countries"))
         return AWAITING_COUNTRY
     
     if query.data in ["other_countries_prev", "other_countries_next"]:
-        page = context.chat_data.get('other_countries_page', 0)
+        page = context.user_data.get('other_countries_page', 0)
         page = max(0, page - 1) if query.data.endswith("_prev") else page + 1
-        context.chat_data['other_countries_page'] = page
-        await query.edit_message_reply_markup(reply_markup=get_paginated_menu(context.chat_data['other_countries'], page, "other_countries", "show_main_countries"))
+        context.user_data['other_countries_page'] = page
+        await query.edit_message_reply_markup(reply_markup=get_paginated_menu(context.user_data['other_countries'], page, "other_countries", "show_main_countries"))
         return AWAITING_COUNTRY
 
     if query.data == "show_main_countries":
         main_countries_menu_keyboard = []
-        for country in context.chat_data['main_countries']:
+        for country in context.user_data['main_countries']:
             main_countries_menu_keyboard.append([InlineKeyboardButton(country, callback_data=f"country_{country}")])
-        if context.chat_data['other_countries']:
+        if context.user_data['other_countries']:
             main_countries_menu_keyboard.append([InlineKeyboardButton("Інші країни >>", callback_data="show_other_countries")])
         await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(main_countries_menu_keyboard))
         return AWAITING_COUNTRY
         
     country_name = query.data.split('_', 1)[1]
-    user_sessions[chat_id]['country'] = country_name
+    user_sessions[user_id]['country'] = country_name
     
     with open(DATA_FILE, 'r', encoding='utf-8') as f: data = json.load(f)
     institutions_list = data['institutions'].get(country_name, [])
@@ -989,15 +934,15 @@ async def select_country(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def select_institution(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    chat_id = query.message.chat.id
+    user_id = query.from_user.id
     
     with open(DATA_FILE, 'r', encoding='utf-8') as f: data = json.load(f)
-    country = user_sessions[chat_id]['country']
+    country = user_sessions[user_id]['country']
     institutions_list = data['institutions'].get(country, [])
     
     inst_index = int(query.data.split('_', 1)[1])
     inst_name = institutions_list[inst_index]
-    user_sessions[chat_id]['institution'] = inst_name
+    user_sessions[user_id]['institution'] = inst_name
     
     try:
         all_available_services = data['services']
@@ -1013,11 +958,11 @@ async def select_institution(update: Update, context: ContextTypes.DEFAULT_TYPE)
     main_service_options = [s for s in main_service_options_def if s in all_available_services]
     other_service_options = sorted([s for s in all_available_services if s not in main_service_options and s])
     
-    context.chat_data['all_services_map'] = {f"service_{i}": text for i, text in enumerate(main_service_options + other_service_options)}
+    context.user_data['all_services_map'] = {f"service_{i}": text for i, text in enumerate(main_service_options + other_service_options)}
     
     keyboard = []
     for opt in main_service_options:
-        cb_data = next((key for key, value in context.chat_data['all_services_map'].items() if value == opt), None)
+        cb_data = next((key for key, value in context.user_data['all_services_map'].items() if value == opt), None)
         if cb_data:
             keyboard.append([InlineKeyboardButton(text=opt, callback_data=cb_data)])
     if other_service_options:
@@ -1030,9 +975,9 @@ async def select_institution(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def select_service(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    chat_id = query.message.chat.id
+    user_id = query.from_user.id
     
-    all_services_map = context.chat_data.get('all_services_map', {})
+    all_services_map = context.user_data.get('all_services_map', {})
     if not all_services_map:
         await query.edit_message_text("Сталася помилка, спробуйте знову /book_new")
         return ConversationHandler.END
@@ -1077,7 +1022,7 @@ async def select_service(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if callback_data.startswith("service_"):
         selected_service = all_services_map.get(callback_data)
         if selected_service:
-            user_sessions[chat_id]['service_type'] = selected_service
+            user_sessions[user_id]['service_type'] = selected_service
             keyboard_recipient = [
                 [InlineKeyboardButton("Для себе", callback_data="recipient_self")],
                 [InlineKeyboardButton("Для своєї дитини/підопічного", callback_data="recipient_child")]
@@ -1091,57 +1036,60 @@ async def select_service(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def select_recipient(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    chat_id = query.message.chat.id
+    user_id = query.from_user.id
     recipient = query.data.split('_')[1]
-    user_sessions[chat_id]['service_recipient'] = recipient
+    user_sessions[user_id]['service_recipient'] = recipient
     if recipient == 'child':
         await query.edit_message_text("Введіть ПІБ дитини у форматі: Прізвище Ім'я По-батькові")
         return AWAITING_CHILD_DATA
     else:
-        return await finalize_setup(query.message, chat_id, context)
+        return await finalize_setup(query.message, user_id, context)
 
 async def receive_child_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
     parts = update.message.text.split()
     if len(parts) >= 2:
-        user_sessions[chat_id]['child_surname'] = parts[0]
-        user_sessions[chat_id]['child_firstname'] = parts[1]
-        user_sessions[chat_id]['child_middlename'] = " ".join(parts[2:])
-        return await finalize_setup(update.message, chat_id, context)
+        user_sessions[user_id]['child_surname'] = parts[0]
+        user_sessions[user_id]['child_firstname'] = parts[1]
+        user_sessions[user_id]['child_middlename'] = " ".join(parts[2:])
+        return await finalize_setup(update.message, user_id, context)
     else:
         await update.message.reply_text("Невірний формат. Введіть Прізвище та Ім'я.")
         return AWAITING_CHILD_DATA
 
-async def finalize_setup(message, chat_id, context):
-    await save_user_data(chat_id, user_sessions[chat_id])
-    user_sessions[chat_id]['status'] = 'ready'
+async def finalize_setup(message, user_id, context):
+    chat_id = message.chat_id
+    await save_user_data(user_id, user_sessions[user_id])
+    user_sessions[user_id]['status'] = 'ready'
     await context.bot.send_message(chat_id, "🎉 **Налаштування завершено!**\nЗавдання додано до черги.")
-    await task_queue.put(chat_id)
-    logging.info(f"Користувач {chat_id} доданий до черги.")
+    await task_queue.put(user_id)
+    logging.info(f"Користувач {user_id} доданий до черги.")
     return ConversationHandler.END
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message_source = update.callback_query.message if update.callback_query else update.message
+    user_id = update.effective_user.id
     chat_id = message_source.chat_id
     
     queue_size = task_queue.qsize()
     position_text = "Вашого завдання немає в черзі."
     try:
-        user_position = list(task_queue._queue).index(chat_id) + 1
+        user_position = list(task_queue._queue).index(user_id) + 1
         position_text = f"Ваша позиція в черзі: **{user_position}**."
     except ValueError: pass
     await context.bot.send_message(chat_id, f"⚙️ Воркерів: **{WORKER_COUNT}** | 👥 В черзі: **{queue_size}**\n{position_text}")
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     message_source = update.callback_query.message if update.callback_query else update.message
+    user_id = update.effective_user.id
     chat_id = message_source.chat_id
     
-    if chat_id in user_sessions: del user_sessions[chat_id]
+    if user_id in user_sessions: del user_sessions[user_id]
     
     temp_queue = []
     while not task_queue.empty():
         item = await task_queue.get()
-        if item != chat_id:
+        if item != user_id:
             temp_queue.append(item)
     for item in temp_queue:
         await task_queue.put(item)
@@ -1150,7 +1098,6 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return ConversationHandler.END
 
 async def show_keyboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Sends a message with a custom keyboard."""
     keyboard = [
         [KeyboardButton("🏠 Головне меню"), KeyboardButton("📊 Дізнатися статус")],
         [KeyboardButton("📝 Нове налаштування"), KeyboardButton("▶️ Швидкий запуск")],
@@ -1160,7 +1107,6 @@ async def show_keyboard_command(update: Update, context: ContextTypes.DEFAULT_TY
     await update.message.reply_text("⌨️ Клавіатуру з командами активовано.", reply_markup=reply_markup)
 
 async def hide_keyboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Hides the custom keyboard."""
     await update.message.reply_text("Клавіатуру сховано.", reply_markup=ReplyKeyboardRemove())
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1215,6 +1161,7 @@ def main() -> None:
             CommandHandler("menu", menu_command),
             MessageHandler(filters.Regex("^📝 Нове налаштування$"), book_new_command),
             MessageHandler(filters.Regex("^▶️ Швидкий запуск$"), book_command),
+            CallbackQueryHandler(main_menu_handler, pattern='^main_book_new$')
         ],
         states={
             MAIN_MENU: [CallbackQueryHandler(main_menu_handler, pattern='^main_')],
@@ -1230,14 +1177,14 @@ def main() -> None:
             AWAITING_CHILD_DATA: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_child_data)],
         },
         fallbacks=[CommandHandler("cancel", cancel_command), MessageHandler(filters.Regex("^❌ Скасувати завдання$"), cancel_command)],
-        per_user=False, per_chat=True, per_message=False
+        per_user=True, per_chat=True, per_message=False
     )
 
     update_lists_handler = ConversationHandler(
         entry_points=[CommandHandler("update_lists", update_lists_command)],
         states={UPDATING_LISTS: [CallbackQueryHandler(start_scraping, pattern='^start_scraping$')]},
         fallbacks=[CommandHandler("cancel", cancel_command)],
-        per_message=False
+        per_user=True, per_chat=True, per_message=False
     )
     
     application.add_handler(CommandHandler("start", start_command))
