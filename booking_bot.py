@@ -293,16 +293,17 @@ async def run_booking_session(bot: Bot, user_id: int, user_data: dict, worker_id
         log_func("="*20 + " ПОЧАТОК НОВОЇ СЕСІЇ " + "="*20)
         p = await async_playwright().start()
         
-        context = await p.chromium.launch_persistent_context(
-            user_data_dir,
+        browser = await p.chromium.launch(
             headless=headless_mode,
             channel="chrome",
             args=["--start-maximized", "--disable-blink-features=AutomationControlled"],
+            timeout=60000
+        )
+        
+        context = await browser.new_context(
+            locale="uk-UA", 
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-            locale="uk-UA",
-            timezone_id="Europe/Kiev",
-            viewport=None,
-            timeout=90000 
+            timezone_id="Europe/Kiev"
         )
         page = await context.new_page()
 
@@ -458,12 +459,14 @@ async def run_booking_session(bot: Bot, user_id: int, user_data: dict, worker_id
         if page and not page.is_closed():
             await save_screenshot(page, "error_screenshot", user_id)
         
-        if context: await context.close()
+        if context and not context.is_closed(): await context.close()
+        if 'browser' in locals() and browser and browser.is_connected(): await browser.close()
         if p: await p.stop()
         raise SessionResetException(f"Критична помилка: {e}")
     finally:
-        if 'p' in locals() and 'p' is not None:
+        if 'p' in locals() and p is not None:
              if context and not context.is_closed(): await context.close()
+             if 'browser' in locals() and browser and browser.is_connected(): await browser.close()
              if p and p.is_connected(): await p.stop()
         log_func("="*20 + " КІНЕЦЬ СЕСІЇ " + "="*20 + "\n")
 
@@ -503,57 +506,72 @@ async def worker(worker_id: int, app: Application, headless_mode: bool):
         except Exception as e:
             logging.critical(f"Критична помилка у воркері {worker_id}: {e}")
 
+# --- Telegram Handlers ---
+(
+    MAIN_MENU, SELECTING_AUTH, AWAITING_KEY_FILE, AWAITING_PASSWORD,
+    AWAITING_DOB_GENDER, AWAITING_DOB_CALENDAR,
+    AWAITING_COUNTRY, AWAITING_INSTITUTION,
+    AWAITING_SERVICE, AWAITING_RECIPIENT, AWAITING_CHILD_DATA
+) = range(11)
+
+UPDATING_LISTS = 11
+
 async def update_lists_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user_id = update.effective_user.id
+    """Entry point for the admin-only list update conversation."""
+    user = update.effective_user
     owner_id_str = os.getenv('OWNER_TELEGRAM_ID')
 
-    if not owner_id_str:
-        await update.message.reply_text("❗️ Команду не налаштовано: ID адміністратора не вказано.")
-        logging.warning(f"Користувач {user_id} намагався виконати /update_lists, але OWNER_TELEGRAM_ID не встановлено.")
-        return ConversationHandler.END
-
-    if user_id != int(owner_id_str):
+    if not owner_id_str or user.id != int(owner_id_str):
         await update.message.reply_text("🚫 У вас немає прав для виконання цієї команди.")
-        logging.warning(f"Користувач {user_id} (не адмін) намагався виконати /update_lists.")
+        logging.warning(f"Користувач {get_user_info(update)} (не адмін) намагався виконати /update_lists.")
         return ConversationHandler.END
 
     logging.info(f"Адміністратор {get_user_info(update)} виконав команду /update_lists")
+    keyboard = [[InlineKeyboardButton("Почати оновлення", callback_data="start_scraping")]]
     await update.message.reply_text(
-        "**Оновлення довідників (лише для адміністратора)**\n\n"
-        "Цей процес запустить браузер. Вам потрібно буде вручну авторизуватися на сайті e-consul.\n"
-        "Після успішного входу, не закривайте браузер. Скрипт автоматично збере дані.\n\n"
-        "Натисніть 'Почати', щоб продовжити.",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Почати", callback_data="start_scraping")]])
+        "**Оновлення довідників**\n\n"
+        "Цей процес запустить видимий браузер. Вам потрібно буде **вручну авторизуватися** на сайті e-consul.\n\n"
+        "Після успішного входу, скрипт автоматично збере всі необхідні дані.\n\n"
+        "Натисніть кнопку нижче, щоб почати.",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
     return UPDATING_LISTS
 
 async def start_scraping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handles the scraping process after the admin agrees."""
     query = update.callback_query
     await query.answer()
     chat_id = query.message.chat.id
     user_id = query.from_user.id
     
-    user_data_dir = os.path.join(BASE_PROFILES_DIR, f"profile_{user_id}_admin")
-    await query.edit_message_text("Запускаю браузер з профілем адміністратора...")
+    p = browser = browser_context = page = None
+    await query.edit_message_text("⚙️ Запускаю браузер...")
 
-    p = browser_context = page = None
     try:
-        p = await async_playwright().start() 
-        browser_context = await p.chromium.launch_persistent_context(
-            user_data_dir,
-            headless=False,
+        p = await async_playwright().start()
+        browser = await p.chromium.launch(
+            headless=False, # Must be visible for manual login
             channel="chrome",
-            args=["--start-maximized", "--disable-blink-features=AutomationControlled"]
+            args=["--start-maximized", "--disable-blink-features=AutomationControlled"],
+            timeout=60000
         )
-        page = browser_context.pages[0] if browser_context.pages else await browser_context.new_page()
+        browser_context = await browser.new_context(
+            locale="uk-UA",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            timezone_id="Europe/Kiev"
+        )
+        page = await browser_context.new_page()
         
         await page.evaluate("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         logging.info("Маскування navigator.webdriver застосовано.")
         
         await page.goto("https://e-consul.gov.ua/", timeout=60000, wait_until="domcontentloaded")
-        await context.bot.send_message(chat_id, 
-            "Браузер запущено. Будь ласка, увійдіть до свого облікового запису на сайті e-consul.\n"
-            "Після успішного входу, поверніться сюди.")
+        
+        await context.bot.send_message(
+            chat_id,
+            "🖥️ Браузер запущено.\n\nБудь ласка, увійдіть до свого облікового запису на сайті e-consul. "
+            "Після успішного входу, поверніться сюди, скрипт продовжить роботу автоматично."
+        )
 
         await page.wait_for_url("**/messages**", timeout=300000)
         await context.bot.send_message(chat_id, "✅ Авторизація пройдена. Починаю збір даних...")
@@ -575,9 +593,9 @@ async def start_scraping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         try:
             with open(DATA_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                country_list = data['countries']
+                country_list = data.get('countries', [])
             if not country_list:
-                raise Exception("Список країн у файлі порожній.")
+                raise Exception("Список країн у файлі порожній або відсутній.")
             logging.info(f"Успішно завантажено {len(country_list)} країн з файлу.")
             await context.bot.send_message(chat_id, f"✅ Список з {len(country_list)} країн завантажено.")
         except Exception as e:
@@ -694,19 +712,71 @@ async def start_scraping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
              await send_telegram_photo(context.bot, chat_id, path, "Критична помилка під час збору даних")
         await context.bot.send_message(chat_id, f"❗️ Сталася критична помилка: {str(e).splitlines()[0]}")
     finally:
-        if browser_context: await browser_context.close()
-        if p: await p.stop()
+        if browser_context:
+            await browser_context.close()
+        if browser and browser.is_connected():
+            await browser.close()
+        if p:
+            await p.stop()
+            
     return ConversationHandler.END
 
-# --- Telegram Handlers ---
-(
-    MAIN_MENU, SELECTING_AUTH, AWAITING_KEY_FILE, AWAITING_PASSWORD,
-    AWAITING_DOB_GENDER, AWAITING_DOB_CALENDAR,
-    AWAITING_COUNTRY, AWAITING_INSTITUTION,
-    AWAITING_SERVICE, AWAITING_RECIPIENT, AWAITING_CHILD_DATA
-) = range(11)
+async def reply_to_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отправляет ответ от администратора конкретному пользователю."""
+    admin_user = update.effective_user
+    owner_id_str = os.getenv('OWNER_TELEGRAM_ID')
 
-UPDATING_LISTS = 11
+    if not owner_id_str or admin_user.id != int(owner_id_str):
+        return
+
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text(
+            "⚠️ **Неправильний формат.**\n"
+            "Використовуйте: `/reply <user_id> <текст повідомлення>`",
+            parse_mode='MarkdownV2'
+        )
+        return
+
+    try:
+        target_user_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ ID користувача має бути числом.")
+        return
+
+    reply_text = " ".join(context.args[1:])
+
+    try:
+        await context.bot.send_message(
+            chat_id=target_user_id,
+            text=f"💬 **Відповідь від адміністратора:**\n\n{reply_text}"
+        )
+        await update.message.reply_text(f"✅ Повідомлення успішно надіслано користувачу `{target_user_id}`.")
+        logging.info(f"Адміністратор {admin_user.id} відповів користувачу {target_user_id}.")
+    except TelegramError as e:
+        await update.message.reply_text(f"❗️ Не вдалося надіслати повідомлення користувачу `{target_user_id}`.\n**Помилка:** {e.message}")
+        logging.error(f"Помилка при спробі відповіді користувачу {target_user_id}: {e}")
+
+async def forward_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Пересылает сообщение от пользователя администратору."""
+    user = update.effective_user
+    owner_id_str = os.getenv('OWNER_TELEGRAM_ID')
+
+    if not owner_id_str:
+        logging.warning("OWNER_TELEGRAM_ID не встановлено, пересилка повідомлень неможлива.")
+        return
+
+    owner_id = int(owner_id_str)
+
+    if user.id == owner_id:
+        return
+
+    reply_instruction = f"Для відповіді користувачу `{user.id}` використовуйте команду:\n`/reply {user.id} ваш текст`"
+    await context.bot.send_message(chat_id=owner_id, text=reply_instruction, parse_mode='MarkdownV2')
+
+    await context.bot.forward_message(chat_id=owner_id, from_chat_id=user.id, message_id=update.message.message_id)
+
+    await update.message.reply_text("✅ Ваше повідомлення надіслано адміністратору. Очікуйте на відповідь.")
+    logging.info(f"Переслано повідомлення від {user.id} до адміністратора {owner_id}.")
 
 def get_user_info(update: Update) -> str:
     user = update.effective_user
@@ -1116,7 +1186,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     message_source = update.callback_query.message if update.callback_query else update.message
     user_id = update.effective_user.id
-    chat_id = message_source.chat_id
+    chat_id = message_source.chat.id
     
     if user_id in user_sessions: del user_sessions[user_id]
     
@@ -1179,7 +1249,10 @@ def main() -> None:
 
         owner_id = os.getenv('OWNER_TELEGRAM_ID')
         if owner_id:
-            admin_commands = user_commands + [BotCommand("update_lists", "🔄 Оновити списки (АДМІН)")]
+            admin_commands = user_commands + [
+                BotCommand("update_lists", "🔄 Оновити списки (АДМІН)"),
+                BotCommand("reply", "💬 Відповісти користувачу (АДМІН)")
+            ]
             try:
                 await application.bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=int(owner_id)))
                 logging.info(f"Встановлено розширені команди для адміністратора (ID: {owner_id}).")
@@ -1214,14 +1287,14 @@ def main() -> None:
             AWAITING_CHILD_DATA: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_child_data)],
         },
         fallbacks=[CommandHandler("cancel", cancel_command), MessageHandler(filters.Regex("^❌ Скасувати завдання$"), cancel_command)],
-        per_user=True, per_chat=True, per_message=False
+        per_user=True, per_chat=True
     )
 
     update_lists_handler = ConversationHandler(
         entry_points=[CommandHandler("update_lists", update_lists_command)],
         states={UPDATING_LISTS: [CallbackQueryHandler(start_scraping, pattern='^start_scraping$')]},
         fallbacks=[CommandHandler("cancel", cancel_command)],
-        per_user=True, per_chat=True, per_message=False
+        per_user=True, per_chat=True
     )
     
     application.add_handler(CommandHandler("start", start_command))
@@ -1236,6 +1309,13 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.Regex("^🏠 Головне меню$"), menu_command))
     application.add_handler(MessageHandler(filters.Regex("^📊 Дізнатися статус$"), status_command))
     application.add_handler(MessageHandler(filters.Regex("^⌨️ Сховати клавіатуру$"), hide_keyboard_command))
+    
+    # Добавляем обработчик для команды /reply
+    application.add_handler(CommandHandler("reply", reply_to_user))
+    
+    # Добавляем обработчик для пересылки всех остальных текстовых сообщений
+    # Он должен быть одним из последних, чтобы не мешать другим обработчикам
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, forward_to_admin))
 
     application.add_error_handler(error_handler)
     
