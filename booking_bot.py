@@ -30,7 +30,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     filters,
 )
-from telegram.error import TelegramError
+from telegram.error import TelegramError, BadRequest
 
 # --- CONFIGURATION ---
 load_dotenv()
@@ -192,7 +192,7 @@ async def check_session_validity(page):
             return False
             
         session_ended_locator = page.locator('text="Сесія закінчилася"')
-        if await session_ended_locator.is_visible():
+        if await session_ended_locator.is_visible(timeout=2000):
             logging.warning("Виявлено повідомлення 'Сесія закінчилася'. Сесія недійсна.")
             return False
 
@@ -258,8 +258,15 @@ async def book_available_slot(page, bot, user_id, chat_id, log_func):
             path = await save_screenshot(page, "final_confirmation", user_id)
             await send_telegram_photo(bot, chat_id, path, "Екран перед фінальним підтвердженням.")
             await page.locator(confirm_button_selector).click()
+            
+            log_func("Очікую підтвердження бронювання або переходу на сторінку 'Мої візити'...")
             success_locator = page.locator('text="Ваш візит успішно заброньовано"')
-            await expect(success_locator).to_be_visible(timeout=60000)
+            try:
+                await expect(success_locator.or_(page.get_by_role("heading", name="Мої візити"))).to_be_visible(timeout=60000)
+            except PlaywrightTimeoutError:
+                log_func("Не дочекався ні підтвердження, ні переходу на 'Мої візити'.")
+                raise
+            
             final_message = "!!! УСПІХ: Візит успішно заброньовано! Перевірте пошту та сторінку 'Мої візити'."
             log_func(final_message)
             await bot.send_message(chat_id, f"🎉 **УСПІХ!** 🎉\n{final_message}")
@@ -271,15 +278,14 @@ async def book_available_slot(page, bot, user_id, chat_id, log_func):
     except Exception as e:
         error_message = f"Критична помилка під час автоматичного бронювання: {e}"
         log_func(error_message)
-        await bot.send_message(chat_id, f"❗️ Помилка під час бронювання: {e}")
+        await bot.send_message(chat_id, f"❗️ Помилка під час бронювання: {str(e).splitlines()[0]}")
         path = await save_screenshot(page, "booking_error", user_id)
         await send_telegram_photo(bot, chat_id, path, "Помилка на етапі бронювання.")
         raise SessionResetException(f"Помилка під час бронювання: {e}")
 
 async def run_booking_session(bot: Bot, user_id: int, user_data: dict, worker_id: int, headless_mode: bool):
-    """Main worker function to perform the booking using a persistent profile."""
     p = context = page = None
-    chat_id = user_data['chat_id']
+    chat_id = user_data.get('chat_id')
     log_func = lambda msg: logging.info(f"[Воркер-{worker_id}][Користувач-{user_id}] {msg}")
     user_data_dir = os.path.join(BASE_PROFILES_DIR, f"profile_{user_id}")
 
@@ -298,8 +304,7 @@ async def run_booking_session(bot: Bot, user_id: int, user_data: dict, worker_id
             viewport=None,
             timeout=90000 
         )
-        
-        page = context.pages[0] if context.pages else await context.new_page()
+        page = await context.new_page()
 
         await page.evaluate("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         log_func("Маскування navigator.webdriver застосовано.")
@@ -395,10 +400,26 @@ async def run_booking_session(bot: Bot, user_id: int, user_data: dict, worker_id
             await page.locator('input[aria-label="Прізвище"]').fill(user_data['child_surname'])
             await page.locator('input[aria-label=" Ім\'я"]').fill(user_data['child_firstname'])
             await page.locator('input[aria-label="По батькові"]').fill(user_data['child_middlename'])
+        
         await page.get_by_role("button", name="Далі").click()
+        
+        log_func("Натиснуто 'Далі', очікую переходу або повідомлення про помилку...")
+        service_unavailable_locator = page.locator('text*="Послуга тимчасово недоступна"')
+        date_time_page_locator = page.locator('text="Вільні дати"') 
+
+        await expect(service_unavailable_locator.or_(date_time_page_locator)).to_be_visible(timeout=60000)
+
+        if await service_unavailable_locator.is_visible():
+            error_text = await service_unavailable_locator.text_content()
+            log_func(f"Послуга недоступна. Повідомлення на сайті: {error_text}")
+            await bot.send_message(chat_id, f"❗️ **Послуга недоступна.**\n\nНа сайті з'явилося повідомлення: \"{error_text}\".\n\nЗавдання зупинено. Будь ласка, почніть заново з іншою послугою, використавши /book_new.")
+            path = await save_screenshot(page, "service_unavailable", user_id)
+            await send_telegram_photo(bot, chat_id, path, "Послуга недоступна на сайті")
+            return
+        
+        await page.wait_for_url("**/dateAndTimeVisitInfo**", timeout=5000)
         log_func("Всі дані успішно введено.")
         await bot.send_message(chat_id, "✅ Всі дані успішно введено.")
-        await page.wait_for_url("**/dateAndTimeVisitInfo**", timeout=60000)
         
         await bot.send_message(chat_id, "Починаю пошук вільних слотів. Це може зайняти багато часу...")
         log_func("Починаю цикл пошуку слотів.")
@@ -424,19 +445,26 @@ async def run_booking_session(bot: Bot, user_id: int, user_data: dict, worker_id
 
     except SessionResetException as e:
         log_func(f"Штатний перезапуск сесії: {e}")
+        if context: await context.close()
+        if p: await p.stop()
         raise
     except Exception as e:
         error_message = f"Сталася критична помилка в run_booking_session: {e}"
         log_func(error_message)
         full_traceback = traceback.format_exc()
         logging.error("\nПОВНИЙ ТРЕЙСБЕК ПОМИЛКИ:\n" + full_traceback)
-        await bot.send_message(chat_id, f"❗️ **Сталася помилка у воркері.**\n\n`{str(e)}`\n\nЗавдання буде перезапущено.")
+        if chat_id:
+            await bot.send_message(chat_id, f"❗️ **Сталася помилка у воркері.**\n\n`{str(e)}`\n\nЗавдання буде перезапущено.")
         if page and not page.is_closed():
             await save_screenshot(page, "error_screenshot", user_id)
-        raise SessionResetException(f"Критична помилка: {e}")
-    finally:
+        
         if context: await context.close()
         if p: await p.stop()
+        raise SessionResetException(f"Критична помилка: {e}")
+    finally:
+        if 'p' in locals() and 'p' is not None:
+             if context and not context.is_closed(): await context.close()
+             if p and p.is_connected(): await p.stop()
         log_func("="*20 + " КІНЕЦЬ СЕСІЇ " + "="*20 + "\n")
 
 # --- Worker and Telegram Handlers ---
@@ -498,13 +526,8 @@ async def update_lists_command(update: Update, context: ContextTypes.DEFAULT_TYP
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Почати", callback_data="start_scraping")]])
     )
     return UPDATING_LISTS
-# ... (Остальная часть скрипта остается без изменений)
 
 async def start_scraping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Собирает списки учреждений и услуг, ИСПОЛЬЗУЯ ГОТОВЫЙ СПИСОК СТРАН из файла.
-    ФИНАЛЬНАЯ ВЕРСИЯ 3.1: Улучшен переход к сбору услуг.
-    """
     query = update.callback_query
     await query.answer()
     chat_id = query.message.chat.id
@@ -828,50 +851,61 @@ async def calendar_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     user_id = query.from_user.id
     chat_id = query.message.chat.id
     action, *params = query.data.split('_')
+
     if action != "calendar":
         return AWAITING_DOB_CALENDAR
+
     command = params[0]
-    if command == "nav":
-        year, month = map(int, params[1:])
-        await query.edit_message_reply_markup(reply_markup=await generate_calendar_keyboard(year, month))
-    elif command == "show" and params[1] == "months":
-        year, month = map(int, params[2:])
-        await query.edit_message_reply_markup(reply_markup=await generate_month_selection_keyboard(year, month))
-    elif command == "show" and params[1] == "years":
-        year, month = map(int, params[2:])
-        await query.edit_message_reply_markup(reply_markup=await generate_year_selection_keyboard(year, month))
-    elif command == "year" and params[1] == "nav":
-        year, month = map(int, params[2:])
-        await query.edit_message_reply_markup(reply_markup=await generate_year_selection_keyboard(year, month))
-    elif command == "select":
-        year, month, day = map(int, params[1:])
-        if day == 0: return AWAITING_DOB_CALENDAR
-        selected_date_str = f"{day:02d}.{month:02d}.{year}"
-        user_sessions[user_id]['date_of_birth'] = selected_date_str
-        await query.edit_message_text(f"Обрана дата: {selected_date_str}")
-        
-        try:
-            with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                all_countries = data['countries']
-        except (FileNotFoundError, KeyError):
-            await context.bot.send_message(chat_id, f"❗️ Файл з даними `{DATA_FILE}` не знайдено. Запустіть /update_lists.")
-            return ConversationHandler.END
+    
+    try:
+        if command == "nav":
+            year, month = map(int, params[1:])
+            await query.edit_message_reply_markup(reply_markup=await generate_calendar_keyboard(year, month))
+        elif command == "show" and params[1] == "months":
+            year, month = map(int, params[2:])
+            await query.edit_message_reply_markup(reply_markup=await generate_month_selection_keyboard(year, month))
+        elif command == "show" and params[1] == "years":
+            year, month = map(int, params[2:])
+            await query.edit_message_reply_markup(reply_markup=await generate_year_selection_keyboard(year, month))
+        elif command == "year" and params[1] == "nav":
+            year, month = map(int, params[2:])
+            await query.edit_message_reply_markup(reply_markup=await generate_year_selection_keyboard(year, month))
+        elif command == "select":
+            year, month, day = map(int, params[1:])
+            if day == 0: return AWAITING_DOB_CALENDAR
+            selected_date_str = f"{day:02d}.{month:02d}.{year}"
+            user_sessions[user_id]['date_of_birth'] = selected_date_str
+            await query.edit_message_text(f"Обрана дата: {selected_date_str}")
+            
+            try:
+                with open(DATA_FILE, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    all_countries = data['countries']
+            except (FileNotFoundError, KeyError):
+                await context.bot.send_message(chat_id, f"❗️ Файл з даними `{DATA_FILE}` не знайдено. Запустіть /update_lists.")
+                return ConversationHandler.END
 
-        main_countries_def = ['Ірландія', 'Польща', 'Німеччина', 'США', 'Чехія', 'Іспанія', 'Італія', 'Канада']
-        main_countries = [c for c in main_countries_def if c in all_countries]
-        other_countries = sorted([c for c in all_countries if c not in main_countries])
+            main_countries_def = ['Ірландія', 'Польща', 'Німеччина', 'США', 'Чехія', 'Іспанія', 'Італія', 'Канада']
+            main_countries = [c for c in main_countries_def if c in all_countries]
+            other_countries = sorted([c for c in all_countries if c not in main_countries])
 
-        context.user_data['main_countries'] = main_countries
-        context.user_data['other_countries'] = other_countries
-        
-        keyboard = [[InlineKeyboardButton(country, callback_data=f"country_{country}")] for country in main_countries]
-        if other_countries:
-            keyboard.append([InlineKeyboardButton("Інші країни >>", callback_data="show_other_countries")])
-        
-        await context.bot.send_message(chat_id, "**Крок 3/5: Місцезнаходження**\n\nВиберіть країну:", 
-                                       reply_markup=InlineKeyboardMarkup(keyboard))
-        return AWAITING_COUNTRY
+            context.user_data['main_countries'] = main_countries
+            context.user_data['other_countries'] = other_countries
+            
+            keyboard = [[InlineKeyboardButton(country, callback_data=f"country_{country}")] for country in main_countries]
+            if other_countries:
+                keyboard.append([InlineKeyboardButton("Інші країни >>", callback_data="show_other_countries")])
+            
+            await context.bot.send_message(chat_id, "**Крок 3/5: Місцезнаходження**\n\nВиберіть країну:", 
+                                           reply_markup=InlineKeyboardMarkup(keyboard))
+            return AWAITING_COUNTRY
+            
+    except BadRequest as e:
+        if "Message is not modified" in str(e):
+            logging.info("Ignored BadRequest: Message is not modified.")
+        else:
+            raise
+            
     return AWAITING_DOB_CALENDAR
 
 async def select_country(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1110,6 +1144,9 @@ async def hide_keyboard_command(update: Update, context: ContextTypes.DEFAULT_TY
     await update.message.reply_text("Клавіатуру сховано.", reply_markup=ReplyKeyboardRemove())
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if isinstance(context.error, BadRequest) and "Message is not modified" in str(context.error):
+        logging.info("Ignored BadRequest: Message is not modified in error_handler.")
+        return
     logging.error(f"Помилка в telegram-handler: {context.error}", exc_info=context.error)
 
 def main() -> None:

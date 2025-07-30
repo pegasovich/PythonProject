@@ -5,6 +5,7 @@
 /user_data_archives/
 /browser_profile*/
 /venv/
+/user_keys/
 
 # Папка со скриншотами (Сгенерированные файлы)
 /screenshots_data/
@@ -41,3 +42,4 @@ browser_profile_193287726/Default/LOG
 browser_profile_193287726/Default/Login Data
 browser_profile_193287726/Default/Login Data For Account
 browser_profile_193287726/Default/Login Data For Account-journal
+user_keys/6367098779/Кривокобильський_О_О_monoКЕП (1).pfx
