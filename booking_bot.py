@@ -184,6 +184,7 @@ async def generate_calendar_keyboard(year: int, month: int) -> InlineKeyboardMar
 
 # --- AUTOMATION BLOCK ---
 
+# <<< ИЗМЕНЕНИЕ НАЧАЛО: Исправлена функция проверки сессии >>>
 async def check_session_validity(page):
     """Checks if the e-consul session is active."""
     try:
@@ -192,9 +193,14 @@ async def check_session_validity(page):
             return False
 
         session_ended_locator = page.locator('text="Сесія закінчилася"')
-        if await session_ended_locator.is_visible(timeout=2000):
+        # Используем try/except с wait_for вместо is_visible с таймаутом
+        try:
+            await session_ended_locator.wait_for(state='visible', timeout=2000)
             logging.warning("Виявлено повідомлення 'Сесія закінчилася'. Сесія недійсна.")
             return False
+        except PlaywrightTimeoutError:
+            # Элемент не найден, что хорошо
+            pass
 
         logged_in_element_selector = page.get_by_role("link", name="Запис на візит")
         await expect(logged_in_element_selector).to_be_visible(timeout=10000)
@@ -207,81 +213,128 @@ async def check_session_validity(page):
         logging.error(f"Помилка під час перевірки дійсності сесії: {e}")
         return False
 
+
+
+# <<< НАЧАЛО ИСПРАВЛЕННОЙ ФУНКЦИИ >>>
 async def book_available_slot(page, bot, user_id, chat_id, log_func):
-    """Finds and books the first available slot."""
+    """
+    Finds and books the first available slot.
+    (Logic from SlotVisitHelp.py, adapted and stabilized for the bot)
+    """
     log_func("Початок автоматичного бронювання слоту.")
     try:
+        # Ждем, пока контейнер с месяцами станет видимым
         month_container_locator = page.locator('div[class*="scrollbar-container"]')
-        await month_container_locator.wait_for(state='visible', timeout=20000)
-        month_tabs_locator = month_container_locator.get_by_text(re.compile(r"^\S+ \d{4}$"))
-        month_tabs_count = await month_tabs_locator.count()
-        if month_tabs_count == 0:
-             raise Exception("Не вдалося знайти вкладки з місяцями.")
-        log_func(f"Успішно знайдено вкладки місяців: {month_tabs_count}")
-        for i in range(month_tabs_count):
-            current_month_tab = page.locator('div[class*="scrollbar-container"]').get_by_text(re.compile(r"^\S+ \d{4}$")).nth(i)
-            month_name = await current_month_tab.text_content()
-            log_func(f"Перевіряю місяць: {month_name}")
-            await current_month_tab.click(timeout=15000)
-            await page.wait_for_timeout(random.randint(1500, 2500))
-            await page.wait_for_load_state('networkidle', timeout=60000)
+        await expect(month_container_locator).to_be_visible(timeout=20000)
+        log_func("Контейнер з місяцями видимий.")
+
+        # Используем надежный локатор по роли
+        month_tabs_locator = page.get_by_role("tab", name=re.compile(r"^\S+ \d{4}$"))
+
+        # >>>>> НОВОЕ ИЗМЕНЕНИЕ: ЖДЕМ ПОЯВЛЕНИЯ КОНТЕНТА ВНУТРИ КОНТЕЙНЕРА <<<<<
+        log_func("Очікую на рендерінг першої вкладки місяця...")
+        await month_tabs_locator.first.wait_for(state='visible', timeout=15000)
+        log_func("Перша вкладка місяця з'явилася.")
+        # >>>>> КОНЕЦ НОВОГО ИЗМЕНЕНИЯ <<<<<
+
+        # Теперь, когда мы уверены, что вкладки есть, получаем их все
+        month_tabs = await month_tabs_locator.all()
+
+        if not month_tabs:
+             raise Exception("Не вдалося знайти вкладки з місяцями після очікування.")
+        log_func(f"Успішно знайдено вкладки місяців: {len(month_tabs)}")
+
+        # Итерация по списку локаторов
+        for month_tab in month_tabs:
+            month_name = await month_tab.text_content()
+            try:
+                log_func(f"Перевіряю місяць: {month_name}")
+                await expect(month_tab).to_be_enabled(timeout=10000)
+                await month_tab.click(timeout=15000)
+                await page.wait_for_load_state('networkidle', timeout=60000)
+                log_func(f"Мережева активність для місяця '{month_name}' завершена.")
+            except PlaywrightTimeoutError as e:
+                log_func(f"Не вдалося обробити місяць '{month_name}'. Тайм-аут: {e}. Пропускаю.")
+                continue
+
             base_locator = page.locator('div:has-text("СЛОТІВ")')
             available_week_locator = base_locator.filter(has_not_text="0 ВІЛЬНИХ")
-            if await available_week_locator.count() == 0:
+
+            available_weeks_count = await available_week_locator.count()
+            if available_weeks_count == 0:
+                log_func(f"В місяці '{month_name}' вільних тижнів не знайдено.")
                 continue
-            log_func(f"!!! Знайдено тиждень з вільними слотами в місяці '{month_name}'!!!")
+
+            log_func(f"!!! Знайдено {available_weeks_count} ТИЖНІВ з вільними слотами в місяці '{month_name}'!!!")
+
             week_block = available_week_locator.first
             path = await save_screenshot(page, f"week_with_slots_{month_name}", user_id)
             await send_telegram_photo(bot, chat_id, path, f"Знайдено тиждень зі слотами в {month_name}.")
+
             await week_block.click(timeout=15000)
             await page.wait_for_load_state('networkidle', timeout=30000)
+
+            log_func("Прокручую вниз, щоб побачити всі слоти...")
             await page.keyboard.press("End")
             await page.wait_for_timeout(1000)
+
             all_time_slots = await page.locator('div[role="button"][aria-label]').all()
+
             first_available_slot = None
-            for slot in all_time_slots:
-                aria_label = await slot.get_attribute("aria-label") or ""
+            for slot_locator in all_time_slots:
+                aria_label = await slot_locator.get_attribute("aria-label") or ""
                 if "цей слот вже заброньовано" not in aria_label:
-                    first_available_slot = slot
+                    first_available_slot = slot_locator
                     break
+
             if first_available_slot is None:
-                log_func(f"У тижні '{month_name}' не знайдено вільних слотів після перевірки. Повертаюся.")
+                log_func("Попередження: вільні слоти не знайдено після перевірки. Повертаюся до вибору місяців...")
                 await page.get_by_role("button", name="Назад").click(timeout=10000)
                 await page.wait_for_load_state('networkidle', timeout=15000)
                 continue
+
             slot_time_text = await first_available_slot.text_content()
             log_func(f"Знайдено вільний слот: {slot_time_text}. Вибираю...")
+
             await first_available_slot.click(timeout=15000)
+            await page.wait_for_timeout(2000)
+
             confirm_button_selector = 'button#finish-button'
             await page.locator(confirm_button_selector).wait_for(state='visible', timeout=15000)
             log_func("Натискаю кнопку 'Підтвердити'...")
+
             path = await save_screenshot(page, "final_confirmation", user_id)
             await send_telegram_photo(bot, chat_id, path, "Екран перед фінальним підтвердженням.")
+
             await page.locator(confirm_button_selector).click()
 
-            log_func("Очікую підтвердження бронювання або переходу на сторінку 'Мої візити'...")
             success_locator = page.locator('text="Ваш візит успішно заброньовано"')
-            try:
-                await expect(success_locator.or_(page.get_by_role("heading", name="Мої візити"))).to_be_visible(timeout=60000)
-            except PlaywrightTimeoutError:
-                log_func("Не дочекався ні підтвердження, ні переходу на 'Мої візити'.")
-                raise
+            my_visits_locator = page.get_by_role("heading", name="Мої візити")
 
+            await expect(success_locator.or_(my_visits_locator)).to_be_visible(timeout=60000)
+            
             final_message = "!!! УСПІХ: Візит успішно заброньовано! Перевірте пошту та сторінку 'Мої візити'."
             log_func(final_message)
             await bot.send_message(chat_id, f"🎉 **УСПІХ!** 🎉\n{final_message}")
             path = await save_screenshot(page, "booking_confirmed", user_id)
             await send_telegram_photo(bot, chat_id, path, "Візит успішно заброньовано!")
+            
             return "Успішне автоматичне бронювання."
-        log_func("Пошук завершено. Немає вільних слотів для бронювання.")
+
+        log_func("Пошук завершено. Не знайдено доступних для бронювання слотів.")
         return "Не вдалося забронювати слот."
+
     except Exception as e:
         error_message = f"Критична помилка під час автоматичного бронювання: {e}"
         log_func(error_message)
         await bot.send_message(chat_id, f"❗️ Помилка під час бронювання: {str(e).splitlines()[0]}")
         path = await save_screenshot(page, "booking_error", user_id)
-        await send_telegram_photo(bot, chat_id, path, "Помилка на етапі бронювання.")
+        if path:
+            await send_telegram_photo(bot, chat_id, path, "Помилка на етапі бронювання.")
         raise SessionResetException(f"Помилка під час бронювання: {e}")
+# <<< КОНЕЦ ИСПРАВЛЕННОЙ ФУНКЦИИ >>>
+
+
 
 async def run_booking_session(bot: Bot, user_id: int, user_data: dict, worker_id: int, headless_mode: bool):
     p = context = page = browser = None
@@ -402,72 +455,107 @@ async def run_booking_session(bot: Bot, user_id: int, user_data: dict, worker_id
             await page.locator('input[aria-label="По батькові"]').fill(user_data['child_middlename'])
 
         await page.get_by_role("button", name="Далі").click()
-
-        log_func("Натиснуто 'Далі', очікую переходу або повідомлення про помилку...")
-        service_unavailable_locator = page.locator('text >> "Послуга тимчасово недоступна"')
-        date_time_page_locator = page.locator('text="Вільні дати"')
-
-        await expect(service_unavailable_locator.or_(date_time_page_locator)).to_be_visible(timeout=60000)
-
-        if await service_unavailable_locator.is_visible():
-            error_text = await service_unavailable_locator.text_content()
-            log_func(f"Послуга недоступна. Повідомлення на сайті: {error_text}")
-            await bot.send_message(chat_id, f"❗️ **Послуга недоступна.**\n\nНа сайті з'явилося повідомлення: \"{error_text}\".\n\nЗавдання зупинено. Будь ласка, почніть заново з іншою послугою, використавши /book_new.")
-            path = await save_screenshot(page, "service_unavailable", user_id)
-            await send_telegram_photo(bot, chat_id, path, "Послуга недоступна на сайті")
-            return
-
-        await page.wait_for_url("**/dateAndTimeVisitInfo**", timeout=5000)
+        await page.wait_for_url("**/dateAndTimeVisitInfo**", timeout=60000)
         log_func("Всі дані успішно введено.")
         await bot.send_message(chat_id, "✅ Всі дані успішно введено.")
 
+        # <<< ИЗМЕНЕНИЕ НАЧАЛО: Заменена логика поиска слотов >>>
         await bot.send_message(chat_id, "Починаю пошук вільних слотів. Це може зайняти багато часу...")
-        log_func("Починаю цикл пошуку слотів.")
-
+        log_func("Починаю цикл пошуку слотів за новою логікою.")
+        
+        searching_slots_message_locator = page.locator('text="Відбувається пошук активних слотів..."')
+        no_slots_message_locator = page.locator('text="На жаль, зараз немає вільного часу. Спробуйте пізніше або зробіть запис у чергу очікування."')
+        
         max_retries = 99999
         for i in range(max_retries):
-            log_func(f"Спроба пошуку слотів #{i + 1}")
-            await expect(page.locator('text="Відбувається пошук активних слотів..."')).to_be_hidden(timeout=120000)
-            await page.wait_for_timeout(5000)
+            current_url = page.url
+            if "dateAndTimeVisitInfo" not in current_url:
+                log_func(f"Увага: виявлено редирект зі сторінки пошуку слотів. URL: {current_url}. Перериваю пошук.")
+                raise SessionResetException("Session was reset, restarting the process.")
 
-            if await page.locator('div[class*="scrollbar-container"]').is_visible():
-                log_func("!!! КАЛЕНДАР ЗНАЙДЕНО! Слоти доступні !!!")
-                await bot.send_message(chat_id, "🔥 **ЗНАЙДЕНО СЛОТИ!** 🔥\nПочинаю бронювання...")
-                result = await book_available_slot(page, bot, user_id, chat_id, log_func)
-                if "Успішне" in result:
-                    return
+            log_func(f"Спроба пошуку слотів #{i + 1}")
+            try:
+                # Ждем появления сообщения о поиске
+                await searching_slots_message_locator.wait_for(state='visible', timeout=15000)
+                log_func("Повідомлення 'Відбувається пошук активних слотів...' з'явилося.")
+                
+                # Ждем, пока оно не исчезнет (длительный таймаут)
+                await searching_slots_message_locator.wait_for(state='hidden', timeout=120000)
+                log_func("Повідомлення 'Відбувається пошук активних слотів...' зникло.")
+                
+                # Небольшая пауза после поиска
+                await page.wait_for_timeout(3000)
+                
+                # Проверяем, появилось ли сообщение "нет слотов"
+                if await no_slots_message_locator.is_visible():
+                    log_func(f"Повідомлення про відсутність слотів знайдено. Спроба {i + 1}. Перезавантажую сторінку...")
+                    await page.reload(timeout=60000, wait_until='domcontentloaded')
+                    await page.wait_for_timeout(random.randint(5000, 10000))
                 else:
-                    raise SessionResetException("Бронювання не вдалося, перезапускаю сесію для нової спроби.")
-            else:
-                log_func("Слотів немає. Перезавантажую сторінку...")
-                await page.reload(wait_until='networkidle')
-                await asyncio.sleep(random.randint(10, 20))
+                    # Если сообщения "нет слотов" нет, значит они есть!
+                    log_func("!!! УВАГА: Повідомлення про відсутність слотів НЕ знайдено. Запускаю автоматичне бронювання! !!!")
+                    await bot.send_message(chat_id, "🔥 **ЗНАЙДЕНО СЛОТИ!** 🔥\nПочинаю бронювання...")
+                    path = await save_screenshot(page, "slots_found_starting_booking", user_id)
+                    await send_telegram_photo(bot, chat_id, path, "Виявлено можливі слоти. Починаю процедуру вибору.")
+                    
+                    booking_result = await book_available_slot(page, bot, user_id, chat_id, log_func)
+                    
+                    # Если бронирование успешно, выходим из цикла и функции
+                    if "Успішне" in booking_result:
+                        return
+                    else:
+                        # Если бронирование не удалось (например, слот заняли), перезапускаем сессию
+                        raise SessionResetException("Бронювання не вдалося, перезапускаю сесію для нової спроби.")
+
+            except PlaywrightTimeoutError as e:
+                log_func(f"КРИТИЧНИЙ ТАЙМАУТ: Повідомлення 'Відбувається пошук активних слотів...' зависло. Перезапуск. Помилка: {e}")
+                raise SessionResetException(f"Critical timeout: 'Searching slots' message stuck. Error: {e}")
+        # <<< ИЗМЕНЕНИЕ КОНЕЦ >>>
+
 
     except SessionResetException as e:
         log_func(f"Штатний перезапуск сесії: {e}")
+        # Закрываем все, чтобы worker мог начать заново
         if context: await context.close()
+        if browser and browser.is_connected(): await browser.close()
         if p: await p.stop()
-        raise
+        raise # Передаем исключение выше, чтобы worker его поймал
+
     except Exception as e:
         error_message = f"Сталася критична помилка в run_booking_session: {e}"
         log_func(error_message)
         full_traceback = traceback.format_exc()
         logging.error("\nПОВНИЙ ТРЕЙСБЕК ПОМИЛКИ:\n" + full_traceback)
-        if chat_id:
-            await bot.send_message(chat_id, f"❗️ **Сталася помилка у воркері.**\n\n`{str(e)}`\n\nЗавдання буде перезапущено.")
+        
+        path = None
         if page and not page.is_closed():
-            await save_screenshot(page, "error_screenshot", user_id)
+            path = await save_screenshot(page, "critical_error_screenshot", user_id)
 
+        if chat_id:
+            caption = (f"❗️ **Сталася помилка у воркері.**\n\n"
+                       f"`{str(e).splitlines()[0]}`\n\n"
+                       f"Завдання буде перезапущено. Дивіться скріншот для деталей.")
+            
+            if path:
+                await send_telegram_photo(bot, chat_id, path, caption=caption)
+            else:
+                await bot.send_message(chat_id, caption)
+
+        # Закрываем все и вызываем SessionResetException для перезапуска
         if context: await context.close()
         if browser and browser.is_connected(): await browser.close()
         if p: await p.stop()
         raise SessionResetException(f"Критична помилка: {e}")
     finally:
+        # <<< ИЗМЕНЕНИЕ НАЧАЛО: Исправлена проверка p.is_connected() >>>
         if p is not None:
              if context: await context.close()
              if browser and browser.is_connected(): await browser.close()
-             if p.is_connected(): await p.stop()
+             # playwright object не имеет is_connected, достаточно просто остановить
+             await p.stop()
+        # <<< ИЗМЕНЕНИЕ КОНЕЦ >>>
         log_func("="*20 + " КІНЕЦЬ СЕСІЇ " + "="*20 + "\n")
+
 
 # --- Worker and Telegram Handlers ---
 
@@ -489,13 +577,14 @@ async def worker(worker_id: int, app: Application, headless_mode: bool):
                 try:
                     await run_booking_session(app.bot, user_id, user_data, worker_id, headless_mode)
                     logging.info(f"[Воркер-{worker_id}] Завдання для {user_id} успішно виконано.")
-                    break
+                    break # Успешный выход из цикла попыток
                 except SessionResetException as e:
                     logging.warning(f"[Воркер-{worker_id}] Перезапуск сесії для {user_id} (спроба {attempt + 1}/{max_restarts}). Причина: {e}")
                     if attempt + 1 >= max_restarts:
                         logging.error(f"Досягнуто ліміту перезапусків для {user_id}. Завдання зупинено.")
                         await app.bot.send_message(chat_id, "Досягнуто ліміту автоматичних перезапусків. Завдання зупинено.")
                         break
+                    await app.bot.send_message(chat_id, f"🔄 Сесію було скинуто. Перезапускаю... (Спроба {attempt + 1}/{max_restarts})")
                     await asyncio.sleep(15)
 
             logging.info(f"[Воркер-{worker_id}] Завершив роботу з користувачем {user_id}.")
@@ -503,7 +592,9 @@ async def worker(worker_id: int, app: Application, headless_mode: bool):
                 del user_sessions[user_id]
             task_queue.task_done()
         except Exception as e:
-            logging.critical(f"Критична помилка у воркері {worker_id}: {e}")
+            logging.critical(f"Критична помилка у воркері {worker_id}: {e}\n{traceback.format_exc()}")
+            task_queue.task_done()
+
 
 async def update_lists_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
