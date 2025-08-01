@@ -284,10 +284,9 @@ async def book_available_slot(page, bot, user_id, chat_id, log_func):
         raise SessionResetException(f"Помилка під час бронювання: {e}")
 
 async def run_booking_session(bot: Bot, user_id: int, user_data: dict, worker_id: int, headless_mode: bool):
-    p = context = page = None
+    p = context = page = browser = None
     chat_id = user_data.get('chat_id')
     log_func = lambda msg: logging.info(f"[Воркер-{worker_id}][Користувач-{user_id}] {msg}")
-    user_data_dir = os.path.join(BASE_PROFILES_DIR, f"profile_{user_id}")
 
     try:
         log_func("="*20 + " ПОЧАТОК НОВОЇ СЕСІЇ " + "="*20)
@@ -459,15 +458,15 @@ async def run_booking_session(bot: Bot, user_id: int, user_data: dict, worker_id
         if page and not page.is_closed():
             await save_screenshot(page, "error_screenshot", user_id)
 
-        if context and not context.is_closed(): await context.close()
-        if 'browser' in locals() and browser and browser.is_connected(): await browser.close()
+        if context: await context.close()
+        if browser and browser.is_connected(): await browser.close()
         if p: await p.stop()
         raise SessionResetException(f"Критична помилка: {e}")
     finally:
-        if 'p' in locals() and p is not None:
-             if context and not context.is_closed(): await context.close()
-             if 'browser' in locals() and browser and browser.is_connected(): await browser.close()
-             if p and p.is_connected(): await p.stop()
+        if p is not None:
+             if context: await context.close()
+             if browser and browser.is_connected(): await browser.close()
+             if p.is_connected(): await p.stop()
         log_func("="*20 + " КІНЕЦЬ СЕСІЇ " + "="*20 + "\n")
 
 # --- Worker and Telegram Handlers ---
@@ -536,10 +535,9 @@ async def start_scraping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     chat_id = query.message.chat.id
     user_id = query.from_user.id
 
-    user_data_dir = os.path.join(BASE_PROFILES_DIR, f"profile_{user_id}_admin")
     await query.edit_message_text("Запускаю браузер з профілем адміністратора...")
 
-    p = browser = context = page = None
+    p = browser = browser_context = page = None
     try:
         p = await async_playwright().start()
         browser = await p.chromium.launch(
@@ -548,12 +546,12 @@ async def start_scraping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             args=["--start-maximized", "--disable-blink-features=AutomationControlled"],
             timeout=60000
         )
-        context = await browser.new_context(
+        browser_context = await browser.new_context(
             locale="uk-UA",
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
             timezone_id="Europe/Kiev"
         )
-        page = await context.new_page()
+        page = await browser_context.new_page()
 
         await page.evaluate("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         logging.info("Маскування navigator.webdriver застосовано.")
@@ -702,7 +700,7 @@ async def start_scraping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
              await send_telegram_photo(context.bot, chat_id, path, "Критична помилка під час збору даних")
         await context.bot.send_message(chat_id, f"❗️ Сталася критична помилка: {str(e).splitlines()[0]}")
     finally:
-        if context and not context.is_closed(): await context.close()
+        if browser_context: await browser_context.close()
         if browser and browser.is_connected(): await browser.close()
         if p: await p.stop()
     return ConversationHandler.END
