@@ -190,7 +190,7 @@ async def check_session_validity(page):
         if "id.e-consul.gov.ua" in page.url:
             logging.warning("On login page, session is invalid.")
             return False
-            
+
         session_ended_locator = page.locator('text="Сесія закінчилася"')
         if await session_ended_locator.is_visible(timeout=2000):
             logging.warning("Виявлено повідомлення 'Сесія закінчилася'. Сесія недійсна.")
@@ -258,7 +258,7 @@ async def book_available_slot(page, bot, user_id, chat_id, log_func):
             path = await save_screenshot(page, "final_confirmation", user_id)
             await send_telegram_photo(bot, chat_id, path, "Екран перед фінальним підтвердженням.")
             await page.locator(confirm_button_selector).click()
-            
+
             log_func("Очікую підтвердження бронювання або переходу на сторінку 'Мої візити'...")
             success_locator = page.locator('text="Ваш візит успішно заброньовано"')
             try:
@@ -266,7 +266,7 @@ async def book_available_slot(page, bot, user_id, chat_id, log_func):
             except PlaywrightTimeoutError:
                 log_func("Не дочекався ні підтвердження, ні переходу на 'Мої візити'.")
                 raise
-            
+
             final_message = "!!! УСПІХ: Візит успішно заброньовано! Перевірте пошту та сторінку 'Мої візити'."
             log_func(final_message)
             await bot.send_message(chat_id, f"🎉 **УСПІХ!** 🎉\n{final_message}")
@@ -292,16 +292,16 @@ async def run_booking_session(bot: Bot, user_id: int, user_data: dict, worker_id
     try:
         log_func("="*20 + " ПОЧАТОК НОВОЇ СЕСІЇ " + "="*20)
         p = await async_playwright().start()
-        
+
         browser = await p.chromium.launch(
             headless=headless_mode,
             channel="chrome",
             args=["--start-maximized", "--disable-blink-features=AutomationControlled"],
             timeout=60000
         )
-        
+
         context = await browser.new_context(
-            locale="uk-UA", 
+            locale="uk-UA",
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
             timezone_id="Europe/Kiev"
         )
@@ -317,15 +317,15 @@ async def run_booking_session(bot: Bot, user_id: int, user_data: dict, worker_id
         if not is_logged_in:
             log_func("Сесія неактивна. Починаю процес авторизації...")
             await bot.send_message(chat_id, "Сесія неактивна. Починаю авторизацію...")
-            
+
             if "id.e-consul.gov.ua" not in page.url:
                  await page.goto("https://id.e-consul.gov.ua/", timeout=60000)
-            
+
             auth_method = user_data['auth_method']
             if auth_method == 'diia':
                 await page.get_by_role("button", name="Дія.Підпис").click()
                 await page.wait_for_load_state('networkidle')
-                await page.wait_for_timeout(3000) 
+                await page.wait_for_timeout(3000)
                 qr_element = page.locator("canvas, div.qr-code").first
                 await qr_element.wait_for(state='visible', timeout=60000)
                 qr_path = await save_screenshot(page, "diia_qr_code", user_id, locator=qr_element)
@@ -358,7 +358,7 @@ async def run_booking_session(bot: Bot, user_id: int, user_data: dict, worker_id
                 await page.wait_for_url("**/id.gov.ua/bankid-auth-callback**", timeout=180000)
                 async with page.expect_navigation(url="**/e-consul.gov.ua/**"):
                     await page.locator('#btnAcceptUserDataAgreement').click()
-            
+
             await page.wait_for_load_state('networkidle')
             await bot.send_message(chat_id, "✅ Авторизація успішна. Профіль сесії збережено.")
             log_func(f"Авторизація успішна. URL: {page.url}")
@@ -381,7 +381,7 @@ async def run_booking_session(bot: Bot, user_id: int, user_data: dict, worker_id
         await page.get_by_label(gender_map[user_data['gender']]).check()
         await page.get_by_role("button", name="Далі").click()
         await page.wait_for_url("**/placeOfVisitInfo**", timeout=60000)
-        
+
         await page.locator('input[id="country"]').fill(user_data['country'])
         await page.locator(f"li:has-text(\"{user_data['country']}\")").click()
         await page.wait_for_timeout(2000)
@@ -394,19 +394,19 @@ async def run_booking_session(bot: Bot, user_id: int, user_data: dict, worker_id
         await service_input.fill(user_data['service_type'], timeout=10000)
         await page.wait_for_timeout(1000)
         await page.get_by_role("option", name=user_data['service_type'], exact=True).click(timeout=10000)
-        
+
         recipient_map = {'self': "Для себе", 'child': "Для своєї дитини, підопічного"}
         await page.get_by_label(recipient_map[user_data['service_recipient']]).check()
         if user_data['service_recipient'] == 'child':
             await page.locator('input[aria-label="Прізвище"]').fill(user_data['child_surname'])
             await page.locator('input[aria-label=" Ім\'я"]').fill(user_data['child_firstname'])
             await page.locator('input[aria-label="По батькові"]').fill(user_data['child_middlename'])
-        
+
         await page.get_by_role("button", name="Далі").click()
-        
+
         log_func("Натиснуто 'Далі', очікую переходу або повідомлення про помилку...")
-        service_unavailable_locator = page.locator('text*="Послуга тимчасово недоступна"')
-        date_time_page_locator = page.locator('text="Вільні дати"') 
+        service_unavailable_locator = page.locator('text >> "Послуга тимчасово недоступна"')
+        date_time_page_locator = page.locator('text="Вільні дати"')
 
         await expect(service_unavailable_locator.or_(date_time_page_locator)).to_be_visible(timeout=60000)
 
@@ -417,14 +417,14 @@ async def run_booking_session(bot: Bot, user_id: int, user_data: dict, worker_id
             path = await save_screenshot(page, "service_unavailable", user_id)
             await send_telegram_photo(bot, chat_id, path, "Послуга недоступна на сайті")
             return
-        
+
         await page.wait_for_url("**/dateAndTimeVisitInfo**", timeout=5000)
         log_func("Всі дані успішно введено.")
         await bot.send_message(chat_id, "✅ Всі дані успішно введено.")
-        
+
         await bot.send_message(chat_id, "Починаю пошук вільних слотів. Це може зайняти багато часу...")
         log_func("Починаю цикл пошуку слотів.")
-        
+
         max_retries = 99999
         for i in range(max_retries):
             log_func(f"Спроба пошуку слотів #{i + 1}")
@@ -458,7 +458,7 @@ async def run_booking_session(bot: Bot, user_id: int, user_data: dict, worker_id
             await bot.send_message(chat_id, f"❗️ **Сталася помилка у воркері.**\n\n`{str(e)}`\n\nЗавдання буде перезапущено.")
         if page and not page.is_closed():
             await save_screenshot(page, "error_screenshot", user_id)
-        
+
         if context and not context.is_closed(): await context.close()
         if 'browser' in locals() and browser and browser.is_connected(): await browser.close()
         if p: await p.stop()
@@ -483,14 +483,14 @@ async def worker(worker_id: int, app: Application, headless_mode: bool):
                 logging.warning(f"[Воркер-{worker_id}] Дані для {user_id} не знайдено, завдання пропущено.")
                 task_queue.task_done()
                 continue
-            
+
             max_restarts = 5
             chat_id = user_data['chat_id']
             for attempt in range(max_restarts):
                 try:
                     await run_booking_session(app.bot, user_id, user_data, worker_id, headless_mode)
                     logging.info(f"[Воркер-{worker_id}] Завдання для {user_id} успішно виконано.")
-                    break 
+                    break
                 except SessionResetException as e:
                     logging.warning(f"[Воркер-{worker_id}] Перезапуск сесії для {user_id} (спроба {attempt + 1}/{max_restarts}). Причина: {e}")
                     if attempt + 1 >= max_restarts:
@@ -535,13 +535,13 @@ async def start_scraping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await query.answer()
     chat_id = query.message.chat.id
     user_id = query.from_user.id
-    
+
     user_data_dir = os.path.join(BASE_PROFILES_DIR, f"profile_{user_id}_admin")
     await query.edit_message_text("Запускаю браузер з профілем адміністратора...")
 
     p = browser = context = page = None
     try:
-        p = await async_playwright().start() 
+        p = await async_playwright().start()
         browser = await p.chromium.launch(
             headless=False,
             channel="chrome",
@@ -554,18 +554,18 @@ async def start_scraping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             timezone_id="Europe/Kiev"
         )
         page = await context.new_page()
-        
+
         await page.evaluate("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         logging.info("Маскування navigator.webdriver застосовано.")
-        
+
         await page.goto("https://e-consul.gov.ua/", timeout=60000, wait_until="domcontentloaded")
-        await context.bot.send_message(chat_id, 
+        await context.bot.send_message(chat_id,
             "Браузер запущено. Будь ласка, увійдіть до свого облікового запису на сайті e-consul.\n"
             "Після успішного входу, поверніться сюди.")
 
         await page.wait_for_url("**/messages**", timeout=300000)
         await context.bot.send_message(chat_id, "✅ Авторизація пройдена. Починаю збір даних...")
-        
+
         logging.info("Перехід до форми вибору країни...")
         await page.get_by_role("link", name="Запис на візит").click()
         await page.get_by_role("link", name="Записатись на візит").click()
@@ -596,9 +596,9 @@ async def start_scraping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         scraped_data = {'countries': country_list, 'institutions': {}}
         country_input = page.locator('input[id="country"]')
         institution_input = page.locator('input[id="consularInstitution"]')
-        
+
         last_successful_country = None
-        
+
         for i, country_name in enumerate(country_list):
             try:
                 await country_input.fill(country_name, timeout=10000)
@@ -606,9 +606,9 @@ async def start_scraping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await country_input.press("ArrowDown")
                 await page.wait_for_timeout(200)
                 await country_input.press("Enter")
-                
+
                 await expect(institution_input).to_be_enabled(timeout=5000)
-                
+
                 institutions = []
                 try:
                     await institution_input.click(force=True, timeout=5000)
@@ -619,14 +619,14 @@ async def start_scraping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 except PlaywrightTimeoutError:
                     logging.info(f"Для країни '{country_name}' установ не знайдено (таймаут очікування списку). Пропускаю.")
                     institutions = []
-                
+
                 scraped_data['institutions'][country_name] = institutions
                 if institutions:
                     last_successful_country = {"name": country_name, "institution": institutions[0]}
 
                 logging.info(f"({i + 1}/{len(country_list)}) Зібрано {len(institutions)} установ для: {country_name}")
 
-                await institution_input.clear() 
+                await institution_input.clear()
                 await country_input.clear()
 
                 if (i + 1) % 25 == 0:
@@ -640,7 +640,7 @@ async def start_scraping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 institution_input = page.locator('input[id="consularInstitution"]')
 
         await context.bot.send_message(chat_id, "Етап 3: Отримую повний список послуг...")
-        
+
         next_button = page.get_by_role("button", name="Далі")
         if not await next_button.is_enabled():
             logging.warning("Кнопка 'Далі' неактивна. Спроба 'розбудити' сторінку, вибравши останню країну.")
@@ -656,11 +656,11 @@ async def start_scraping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         await next_button.click()
         await page.wait_for_url("**/consularServiceInfo**", timeout=60000)
-        
+
         service_input = page.locator('input[id="service"]')
         await service_input.click(timeout=10000)
         await page.get_by_role("option").first.wait_for(state='visible', timeout=15000)
-        
+
         found_services = set()
         no_new_services_streak = 0
         for _ in range(250):
@@ -670,23 +670,23 @@ async def start_scraping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 text = await option.text_content()
                 if text:
                     found_services.add(text.strip())
-            
+
             if len(found_services) > initial_count:
                 no_new_services_streak = 0
             else:
                 no_new_services_streak += 1
-            
+
             if no_new_services_streak >= 15:
                 logging.info("Прокрутка завершена: список послуг перестав оновлюватися.")
                 break
-                
+
             await service_input.press("ArrowDown")
             await page.wait_for_timeout(50)
-        
+
         all_available_services = sorted(list(found_services))
         scraped_data['services'] = all_available_services
         logging.info(f"Успішно зібрано {len(all_available_services)} унікальних послуг.")
-        
+
         with open(DATA_FILE, 'w', encoding='utf-8') as f:
             json.dump(scraped_data, f, ensure_ascii=False, indent=4)
 
@@ -728,11 +728,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def start_new_booking_flow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
-    
+
     if user_id in list(task_queue._queue) or (user_sessions.get(user_id) and user_sessions[user_id].get('status') == 'ready'):
         await context.bot.send_message(chat_id, "❗️ Ваше завдання вже в черзі. Для скасування використовуйте /cancel.")
         return ConversationHandler.END
-    
+
     user_sessions[user_id] = {'user_id': user_id, 'chat_id': chat_id}
     keyboard = [
         [InlineKeyboardButton("Дія.Підпис", callback_data='diia')],
@@ -765,7 +765,7 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 async def main_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    
+
     if query.data == "main_book_new":
         await query.message.delete()
         return await start_new_booking_flow(query, context)
@@ -782,12 +782,12 @@ async def book_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     if user_id in list(task_queue._queue) or (user_sessions.get(user_id) and user_sessions[user_id].get('status') == 'ready'):
         await update.message.reply_text("❗️ Ваше завдання вже в черзі. Для скасування використовуйте /cancel.")
         return ConversationHandler.END
-        
+
     persisted_data = load_user_data(user_id)
     if not persisted_data:
         await update.message.reply_text("Збережені дані не знайдено. Починаю нове налаштування...")
         return await start_new_booking_flow(update, context)
-    
+
     user_sessions[user_id] = persisted_data
     user_sessions[user_id]['user_id'] = user_id
     user_sessions[user_id]['chat_id'] = chat_id
@@ -850,7 +850,7 @@ async def select_gender(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     user_id = query.from_user.id
     user_sessions[user_id]['gender'] = query.data.split('_')[1]
     now = datetime.now()
-    await query.edit_message_text("Стать обрано. Тепер виберіть вашу дату народження:", 
+    await query.edit_message_text("Стать обрано. Тепер виберіть вашу дату народження:",
                                   reply_markup=await generate_calendar_keyboard(now.year, now.month))
     return AWAITING_DOB_CALENDAR
 
@@ -865,7 +865,7 @@ async def calendar_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return AWAITING_DOB_CALENDAR
 
     command = params[0]
-    
+
     try:
         if command == "nav":
             year, month = map(int, params[1:])
@@ -885,7 +885,7 @@ async def calendar_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             selected_date_str = f"{day:02d}.{month:02d}.{year}"
             user_sessions[user_id]['date_of_birth'] = selected_date_str
             await query.edit_message_text(f"Обрана дата: {selected_date_str}")
-            
+
             try:
                 with open(DATA_FILE, 'r', encoding='utf-8') as f:
                     data = json.load(f)
@@ -900,21 +900,21 @@ async def calendar_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
             context.user_data['main_countries'] = main_countries
             context.user_data['other_countries'] = other_countries
-            
+
             keyboard = [[InlineKeyboardButton(country, callback_data=f"country_{country}")] for country in main_countries]
             if other_countries:
                 keyboard.append([InlineKeyboardButton("Інші країни >>", callback_data="show_other_countries")])
-            
-            await context.bot.send_message(chat_id, "**Крок 3/5: Місцезнаходження**\n\nВиберіть країну:", 
+
+            await context.bot.send_message(chat_id, "**Крок 3/5: Місцезнаходження**\n\nВиберіть країну:",
                                            reply_markup=InlineKeyboardMarkup(keyboard))
             return AWAITING_COUNTRY
-            
+
     except BadRequest as e:
         if "Message is not modified" in str(e):
             logging.info("Ignored BadRequest: Message is not modified.")
         else:
             raise
-            
+
     return AWAITING_DOB_CALENDAR
 
 async def select_country(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -923,7 +923,7 @@ async def select_country(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_id = query.from_user.id
     chat_id = query.message.chat.id
     page_size = 8
-    
+
     def get_paginated_menu(countries, page_num, callback_prefix, back_callback=None):
         keyboard = []
         start_index = page_num * page_size
@@ -943,7 +943,7 @@ async def select_country(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data['other_countries_page'] = 0
         await query.edit_message_reply_markup(reply_markup=get_paginated_menu(context.user_data['other_countries'], 0, "other_countries", "show_main_countries"))
         return AWAITING_COUNTRY
-    
+
     if query.data in ["other_countries_prev", "other_countries_next"]:
         page = context.user_data.get('other_countries_page', 0)
         page = max(0, page - 1) if query.data.endswith("_prev") else page + 1
@@ -959,17 +959,17 @@ async def select_country(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             main_countries_menu_keyboard.append([InlineKeyboardButton("Інші країни >>", callback_data="show_other_countries")])
         await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(main_countries_menu_keyboard))
         return AWAITING_COUNTRY
-        
+
     country_name = query.data.split('_', 1)[1]
     user_sessions[user_id]['country'] = country_name
-    
+
     with open(DATA_FILE, 'r', encoding='utf-8') as f: data = json.load(f)
     institutions_list = data['institutions'].get(country_name, [])
 
     if not institutions_list:
         await query.edit_message_text(f"Для країни {country_name} не знайдено установ.")
         return ConversationHandler.END
-    
+
     keyboard = [[InlineKeyboardButton(text=(name[:60] + '..') if len(name) > 62 else name, callback_data=f"inst_{i}")] for i, name in enumerate(institutions_list)]
     await query.edit_message_text(f"Країна: {country_name}. Виберіть установу:", reply_markup=InlineKeyboardMarkup(keyboard))
     return AWAITING_INSTITUTION
@@ -978,15 +978,15 @@ async def select_institution(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-    
+
     with open(DATA_FILE, 'r', encoding='utf-8') as f: data = json.load(f)
     country = user_sessions[user_id]['country']
     institutions_list = data['institutions'].get(country, [])
-    
+
     inst_index = int(query.data.split('_', 1)[1])
     inst_name = institutions_list[inst_index]
     user_sessions[user_id]['institution'] = inst_name
-    
+
     try:
         all_available_services = data['services']
     except KeyError:
@@ -1000,9 +1000,9 @@ async def select_institution(update: Update, context: ContextTypes.DEFAULT_TYPE)
     ]
     main_service_options = [s for s in main_service_options_def if s in all_available_services]
     other_service_options = sorted([s for s in all_available_services if s not in main_service_options and s])
-    
+
     context.user_data['all_services_map'] = {f"service_{i}": text for i, text in enumerate(main_service_options + other_service_options)}
-    
+
     keyboard = []
     for opt in main_service_options:
         cb_data = next((key for key, value in context.user_data['all_services_map'].items() if value == opt), None)
@@ -1010,7 +1010,7 @@ async def select_institution(update: Update, context: ContextTypes.DEFAULT_TYPE)
             keyboard.append([InlineKeyboardButton(text=opt, callback_data=cb_data)])
     if other_service_options:
         keyboard.append([InlineKeyboardButton(text="Інші послуги »", callback_data="show_other_services")])
-    
+
     await query.edit_message_text(f"Установа: {inst_name}.\n\n**Крок 4/5: Послуга**\n\nВиберіть тип послуги:",
                                   reply_markup=InlineKeyboardMarkup(keyboard))
     return AWAITING_SERVICE
@@ -1019,12 +1019,12 @@ async def select_service(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-    
+
     all_services_map = context.user_data.get('all_services_map', {})
     if not all_services_map:
         await query.edit_message_text("Сталася помилка, спробуйте знову /book_new")
         return ConversationHandler.END
-    
+
     all_available_services = list(all_services_map.values())
     main_service_options_def = [
         "Оформлення закордонного паспорта",
@@ -1057,11 +1057,11 @@ async def select_service(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if callback_data == "show_other_services":
         await query.edit_message_reply_markup(reply_markup=get_other_menu())
         return AWAITING_SERVICE
-    
+
     if callback_data == "show_main_services":
         await query.edit_message_reply_markup(reply_markup=get_main_menu())
         return AWAITING_SERVICE
-    
+
     if callback_data.startswith("service_"):
         selected_service = all_services_map.get(callback_data)
         if selected_service:
@@ -1073,7 +1073,7 @@ async def select_service(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await query.edit_message_text(f"Послуга: {selected_service}.\n\n**Крок 5/5: Отримувач**\n\nДля кого послуга?",
                                           reply_markup=InlineKeyboardMarkup(keyboard_recipient))
             return AWAITING_RECIPIENT
-    
+
     return AWAITING_SERVICE
 
 async def select_recipient(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1113,7 +1113,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     message_source = update.callback_query.message if update.callback_query else update.message
     user_id = update.effective_user.id
     chat_id = message_source.chat_id
-    
+
     queue_size = task_queue.qsize()
     position_text = "Вашого завдання немає в черзі."
     try:
@@ -1126,9 +1126,9 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     message_source = update.callback_query.message if update.callback_query else update.message
     user_id = update.effective_user.id
     chat_id = message_source.chat_id
-    
+
     if user_id in user_sessions: del user_sessions[user_id]
-    
+
     temp_queue = []
     while not task_queue.empty():
         item = await task_queue.get()
@@ -1164,11 +1164,11 @@ def main() -> None:
         format='[%(asctime)s] %(levelname)s - %(message)s',
         handlers=[logging.FileHandler("bot_activity.log", encoding='utf-8'), logging.StreamHandler(sys.stdout)]
     )
-    
+
     parser = argparse.ArgumentParser(description="Бот для бронювання слотів.")
     parser.add_argument('--headless', action='store_true', help="Запуск в прихованому режимі.")
     args = parser.parse_args()
-    
+
     async def post_init(application: Application):
         os.makedirs(BASE_PROFILES_DIR, exist_ok=True)
         os.makedirs(BASE_SCREENSHOTS_DIR, exist_ok=True)
@@ -1194,12 +1194,12 @@ def main() -> None:
                 logging.info(f"Встановлено розширені команди для адміністратора (ID: {owner_id}).")
             except Exception as e:
                 logging.error(f"Не вдалося встановити команди для адміністратора (ID: {owner_id}): {e}")
-        
+
         for i in range(WORKER_COUNT):
             asyncio.create_task(worker(worker_id=i + 1, app=application, headless_mode=args.headless))
-            
+
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
-    
+
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler("book_new", book_new_command),
@@ -1232,11 +1232,11 @@ def main() -> None:
         fallbacks=[CommandHandler("cancel", cancel_command)],
         per_user=True, per_chat=True
     )
-    
+
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(conv_handler)
     application.add_handler(update_lists_handler)
-    
+
     application.add_handler(CommandHandler("keyboard", show_keyboard_command))
     application.add_handler(CommandHandler("hide_keyboard", hide_keyboard_command))
     application.add_handler(CommandHandler("status", status_command))
@@ -1247,7 +1247,7 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.Regex("^⌨️ Сховати клавіатуру$"), hide_keyboard_command))
 
     application.add_error_handler(error_handler)
-    
+
     if not OWNER_TELEGRAM_ID:
         logging.warning("ПОПЕРЕДЖЕННЯ: OWNER_TELEGRAM_ID не встановлено.")
 
