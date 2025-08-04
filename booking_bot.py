@@ -139,9 +139,14 @@ async def save_browser_session(user_id: int, context, page, bot: Bot):
                     f"Потребуется повторная авторизация при следующем запуске.")
             return False
         
-        # Проверяем доступность основных элементов страницы
-        calendar_container = page.locator('div[class*="scrollbar-container"]')
-        await calendar_container.wait_for(state='visible', timeout=5000)
+        # Проверяем доступность основных элементов страницы (не критично)
+        try:
+            calendar_container = page.locator('div[class*="scrollbar-container"]')
+            await calendar_container.wait_for(state='visible', timeout=3000)
+            logging.info(f"Календарный контейнер найден при сохранении сессии {user_id}")
+        except Exception as calendar_check_error:
+            logging.warning(f"Календарный контейнер не найден при сохранении сессии {user_id}: {calendar_check_error}")
+            # Продолжаем сохранение, но понижаем надежность
         
     except Exception as pre_save_error:
         logging.error(f"Ошибка при проверке страницы перед сохранением сессии {user_id}: {pre_save_error}")
@@ -1428,6 +1433,10 @@ async def run_restored_session(bot: Bot, user_id: int, user_data: dict, worker_i
 async def worker(worker_id: int, app: Application, headless_mode: bool):
     import time
     logging.info(f"[Воркер-{worker_id}] запущений с поддержкой ротации сессий.")
+    
+    # Добавляем счетчик пустых итераций для отладки
+    empty_iterations = 0
+    
     while True:
         try:
             # Сначала проверяем, есть ли пользователи для восстановления сессий
@@ -1438,6 +1447,7 @@ async def worker(worker_id: int, app: Application, headless_mode: bool):
                 user_data = user_sessions.get(rotation_user_id)
                 
                 if user_data:
+                    empty_iterations = 0  # Сбрасываем счетчик пустых итераций
                     worker_start_times[worker_id] = time.time()
                     active_workers[worker_id] = rotation_user_id
                     
@@ -1445,10 +1455,17 @@ async def worker(worker_id: int, app: Application, headless_mode: bool):
                         result = await run_restored_session(app.bot, rotation_user_id, user_data, worker_id)
                         if result == "SUCCESS":
                             logging.info(f"[Воркер-{worker_id}] Успешно обработал восстановленную сессию {rotation_user_id}")
+                            # Удаляем сессию только после успешного завершения
                             if rotation_user_id in user_sessions:
                                 del user_sessions[rotation_user_id]
                         elif result == "SESSION_PAUSED_AGAIN":
                             logging.info(f"[Воркер-{worker_id}] Сессия {rotation_user_id} снова приостановлена")
+                            # НЕ удаляем user_sessions если сессия снова приостановлена
+                        else:
+                            logging.info(f"[Воркер-{worker_id}] Восстановленная сессия {rotation_user_id} завершена с результатом: {result}")
+                            # Удаляем только если сессия НЕ была сохранена снова
+                            if rotation_user_id in user_sessions and rotation_user_id not in paused_sessions:
+                                del user_sessions[rotation_user_id]
                     except Exception as e:
                         logging.error(f"[Воркер-{worker_id}] Ошибка при восстановлении сессии {rotation_user_id}: {e}")
                     
@@ -1459,10 +1476,35 @@ async def worker(worker_id: int, app: Application, headless_mode: bool):
                         del active_workers[worker_id]
                     
                     continue  # Переходим к следующей итерации
+                else:
+                    logging.warning(f"[Воркер-{worker_id}] Пользователь {rotation_user_id} из ротации не найден в user_sessions")
             
-            # Если нет пользователей для восстановления, берем нового из очереди
-            user_id = await task_queue.get()
-            logging.info(f"[Воркер-{worker_id}] Взяв у роботу нового користувача {user_id}.")
+            # Если нет пользователей для восстановления, проверяем основную очередь
+            try:
+                # Используем таймаут, чтобы не блокировать воркер навечно
+                user_id = await asyncio.wait_for(task_queue.get(), timeout=5.0)
+                logging.info(f"[Воркер-{worker_id}] Взяв у роботу нового користувача {user_id}.")
+                empty_iterations = 0  # Сбрасываем счетчик пустых итераций
+                
+            except asyncio.TimeoutError:
+                # Если очередь пуста, увеличиваем счетчик и ждем немного
+                empty_iterations += 1
+                if empty_iterations % 10 == 0:  # Логируем каждые 50 секунд ожидания
+                    logging.debug(f"[Воркер-{worker_id}] Ожидает задач... (итерация {empty_iterations})")
+                    
+                    # Проверяем, не нужно ли освободить ресурсы
+                    if empty_iterations > 60:  # Более 5 минут простоя
+                        logging.info(f"[Воркер-{worker_id}] Долгий простой, проверяю состояние системы...")
+                        # Проверяем количество сохраненных сессий и активных воркеров
+                        saved_sessions_count = len(paused_sessions)
+                        active_workers_count = len(active_workers)
+                        queue_size = task_queue.qsize()
+                        
+                        logging.info(f"[Воркер-{worker_id}] Статус: сохраненных сессий: {saved_sessions_count}, активных воркеров: {active_workers_count}, в очереди: {queue_size}")
+                        empty_iterations = 0  # Сбрасываем счетчик
+                
+                await asyncio.sleep(1)  # Короткая пауза перед следующей проверкой
+                continue
             
             # Отслеживаем время начала работы и активного воркера
             worker_start_times[worker_id] = time.time()
@@ -1510,9 +1552,12 @@ async def worker(worker_id: int, app: Application, headless_mode: bool):
                     await asyncio.sleep(15)
 
             logging.info(f"[Воркер-{worker_id}] Завершив роботу з користувачем {user_id}.")
-            if user_id in user_sessions:
+            # Удаляем сессию только если она НЕ была сохранена для восстановления
+            if user_id in user_sessions and user_id not in paused_sessions:
                 logging.info(f"Видаляю сесію для {user_id}.")
                 del user_sessions[user_id]
+            elif user_id in paused_sessions:
+                logging.info(f"Сессия {user_id} сохранена для восстановления, не удаляю из user_sessions.")
             
             # Очищаем отслеживание воркера
             if worker_id in worker_start_times:
@@ -1610,11 +1655,11 @@ async def start_scraping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         try:
             with open(DATA_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                country_list = data['countries']
+                country_list = sorted(data['countries'])  # Сортируем по алфавиту
             if not country_list:
                 raise Exception("Список країн у файлі порожній.")
-            logging.info(f"Успішно завантажено {len(country_list)} країн з файлу.")
-            await context.bot.send_message(chat_id, f"✅ Список з {len(country_list)} країн завантажено.")
+            logging.info(f"Успішно завантажено {len(country_list)} країн з файлу (відсортовано за алфавітом).")
+            await context.bot.send_message(chat_id, f"✅ Список з {len(country_list)} країн завантажено (відсортовано за алфавітом).")
         except Exception as e:
             await context.bot.send_message(chat_id, f"❗️ Помилка читання файлу `{DATA_FILE}`: {e}. Оновлення неможливе.")
             raise
@@ -1712,6 +1757,8 @@ async def start_scraping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         all_available_services = sorted(list(found_services))
         scraped_data['services'] = all_available_services
+        # Убеждаемся, что страны сохраняются отсортированными по алфавиту
+        scraped_data['countries'] = sorted(scraped_data['countries'])
         logging.info(f"Успішно зібрано {len(all_available_services)} унікальних послуг.")
 
         with open(DATA_FILE, 'w', encoding='utf-8') as f:
@@ -1949,7 +1996,7 @@ async def calendar_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             try:
                 with open(DATA_FILE, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                    all_countries = data['countries']
+                    all_countries = sorted(data['countries'])  # Сортируем по алфавиту
             except (FileNotFoundError, KeyError):
                 await context.bot.send_message(chat_id, f"❗️ Файл з даними `{DATA_FILE}` не знайдено. Запустіть /update_lists.")
                 return ConversationHandler.END
@@ -2177,6 +2224,124 @@ async def finalize_setup(message, user_id, context):
         await context.bot.send_message(chat_id, f"🎉 **Налаштування завершено!**\n📋 Завдання додано до черги.\n\n⏳ **Позиція в черзі: {position}**\n⚙️ Активних воркерів: {WORKER_COUNT}\n\n💡 Поиск начнется, как только освободится воркер.")
     
     return ConversationHandler.END
+
+async def debug_workers_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отладочная команда для проверки состояния воркеров (только для админа)"""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    
+    owner_id_str = os.getenv('OWNER_TELEGRAM_ID')
+    if not owner_id_str or user_id != int(owner_id_str):
+        await context.bot.send_message(chat_id, "🚫 Команда доступна только администратору.")
+        return
+    
+    # Собираем детальную информацию о состоянии системы
+    current_time = time.time()
+    
+    debug_info = [
+        "🔧 **ДЕТАЛЬНАЯ ДИАГНОСТИКА ВОРКЕРОВ:**",
+        "",
+        f"📊 **Основные очереди:**",
+        f"• Основная очередь: {task_queue.qsize()} задач",
+        f"• Ротационная очередь: {session_rotation_queue.qsize()} пользователей",
+        f"• Сохраненные сессии: {len(paused_sessions)} из {MAX_PAUSED_SESSIONS}",
+        "",
+        f"⚙️ **Активные воркеры ({len(active_workers)}):**"
+    ]
+    
+    if active_workers:
+        for worker_id, user_id_working in active_workers.items():
+            start_time = worker_start_times.get(worker_id, current_time)
+            work_duration = int(current_time - start_time)
+            minutes = work_duration // 60
+            seconds = work_duration % 60
+            
+            # Определяем что делает воркер
+            if user_id_working in paused_sessions:
+                status = "🔄 Восстановление сессии"
+            else:
+                status = "🆕 Новый пользователь"
+            
+            debug_info.append(f"  Воркер #{worker_id}: {status}")
+            debug_info.append(f"    └─ Пользователь: {user_id_working}")
+            debug_info.append(f"    └─ Время работы: {minutes}м {seconds}с")
+    else:
+        debug_info.append("  Нет активных воркеров")
+    
+    debug_info.extend([
+        "",
+        f"💾 **Сохраненные сессии:**"
+    ])
+    
+    if paused_sessions:
+        for user_id_session, session_data in paused_sessions.items():
+            last_attempt = session_data['last_attempt']
+            time_since_last = int(current_time - last_attempt)
+            next_retry_in = max(0, SESSION_RETRY_INTERVAL - time_since_last)
+            attempt_count = session_data.get('attempt_count', 0)
+            
+            debug_info.append(f"  User {user_id_session}:")
+            debug_info.append(f"    └─ Попыток: #{attempt_count}")
+            debug_info.append(f"    └─ Возраст: {time_since_last//60}м {time_since_last%60}с")
+            debug_info.append(f"    └─ След. попытка через: {next_retry_in}с")
+    else:
+        debug_info.append("  Нет сохраненных сессий")
+    
+    # Информация о пользователях в основной очереди
+    debug_info.extend([
+        "",
+        f"👥 **Пользователи в user_sessions ({len(user_sessions)}):**"
+    ])
+    
+    ready_users = 0
+    for uid, udata in user_sessions.items():
+        if udata.get('status') == 'ready':
+            ready_users += 1
+    
+    debug_info.append(f"  Готовых к обработке: {ready_users}")
+    
+    # Проверяем потенциальные проблемы
+    debug_info.extend([
+        "",
+        f"⚠️ **Диагностика проблем:**"
+    ])
+    
+    issues = []
+    
+    # Проверка 1: Воркеры без задач
+    if len(active_workers) == 0 and (task_queue.qsize() > 0 or len(paused_sessions) > 0):
+        issues.append("Есть задачи, но нет активных воркеров")
+    
+    # Проверка 2: Долго работающие воркеры
+    for worker_id, start_time in worker_start_times.items():
+        work_duration = current_time - start_time
+        if work_duration > MAX_WORKER_TIME:
+            issues.append(f"Воркер #{worker_id} работает {work_duration//60:.0f}м (лимит: {MAX_WORKER_TIME//60}м)")
+    
+    # Проверка 3: Переполненная ротационная очередь
+    if session_rotation_queue.qsize() > len(paused_sessions) * 2:
+        issues.append(f"Ротационная очередь переполнена: {session_rotation_queue.qsize()} элементов")
+    
+    # Проверка 4: Пользователи готовы, но воркеры простаивают
+    if ready_users > 0 and len(active_workers) < WORKER_COUNT:
+        issues.append(f"Есть готовые пользователи ({ready_users}), но воркеры не активны")
+    
+    if issues:
+        for issue in issues:
+            debug_info.append(f"  ❌ {issue}")
+    else:
+        debug_info.append("  ✅ Проблем не обнаружено")
+    
+    # Отправляем информацию
+    response = "\n".join(debug_info)
+    
+    # Разбиваем на части если слишком длинно
+    if len(response) > 4000:
+        parts = [response[i:i+4000] for i in range(0, len(response), 4000)]
+        for i, part in enumerate(parts):
+            await context.bot.send_message(chat_id, f"Часть {i+1}/{len(parts)}:\n```\n{part}\n```", parse_mode="Markdown")
+    else:
+        await context.bot.send_message(chat_id, f"```\n{response}\n```", parse_mode="Markdown")
 
 async def session_check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Проверяет состояние сохраненной сессии пользователя"""
@@ -2656,6 +2821,7 @@ entry_points=[
     application.add_handler(CommandHandler("hide_keyboard", hide_keyboard_command))
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("session_check", session_check_command))
+    application.add_handler(CommandHandler("debug_workers", debug_workers_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(MessageHandler(filters.Regex("^🏠 Головне меню$"), menu_command))
     application.add_handler(MessageHandler(filters.Regex("^📊 Дізнатися статус$"), status_command))
