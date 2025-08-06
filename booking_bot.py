@@ -1963,6 +1963,34 @@ async def run_booking_session(bot: Bot, user_id: int, user_data: dict, worker_id
                                 if session_valid:
                                     log_func("Пользователь успешно авторизовался")
                                     await safe_send_message(bot, chat_id, "✅ Авторизация успешна! Продолжаю поиск...")
+                                    
+                                    # ВАЖНО: После авторизации нужно перейти к форме выбора слотов
+                                    try:
+                                        log_func("Переход к форме записи после авторизации")
+                                        await safe_send_message(bot, chat_id, "🔄 Перехожу к форме записи...")
+                                        
+                                        # Переходим к записи на визит
+                                        await page.get_by_role("link", name="Запис на візит").click(timeout=10000)
+                                        await page.wait_for_timeout(2000)
+                                        await page.get_by_role("link", name="Записатись на візит").click(timeout=10000)
+                                        await page.wait_for_timeout(2000)
+                                        
+                                        # Заполняем данные из сохраненного профиля пользователя
+                                        if user_data:
+                                            await safe_send_message(bot, chat_id, "📝 Заполняю данные из профиля...")
+                                            # Быстро заполняем форму до страницы выбора времени
+                                            await fill_user_forms_quickly(page, user_data)
+                                            log_func("Successfully navigated to slot selection after auth")
+                                            await safe_send_message(bot, chat_id, "✅ Данные заполнены, начинаю поиск слотов!")
+                                        else:
+                                            log_func("No user data available for form filling")
+                                            await safe_send_message(bot, chat_id, "⚠️ Нет данных профиля для заполнения форм")
+                                            
+                                    except Exception as navigation_error:
+                                        log_func(f"Navigation after auth failed: {navigation_error}")
+                                        await safe_send_message(bot, chat_id, f"⚠️ Ошибка при переходе к форме: {str(navigation_error)[:100]}...")
+                                        # Не критично, продолжаем
+                                    
                                     break
                         except Exception as auth_check_error:
                             log_func(f"Ошибка при проверке авторизации: {auth_check_error}")
