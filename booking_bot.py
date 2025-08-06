@@ -1877,9 +1877,12 @@ async def run_booking_session(bot: Bot, user_id: int, user_data: dict, worker_id
         
         # Перевірка та відновлення браузерної сесії
         session_result = await restore_browser_session(user_id, bot, headless_mode)
+        session_was_restored = False  # Флаг для отслеживания восстановления сессии
+        
         if session_result and len(session_result) == 2:
             context, page = session_result
             browser = None  # restore_browser_session не возвращает browser
+            session_was_restored = True  # Сессия была восстановлена
         else:
             context, page = None, None
         
@@ -1930,6 +1933,11 @@ async def run_booking_session(bot: Bot, user_id: int, user_data: dict, worker_id
         # Перевірка валідності сесії
         session_valid = await check_session_validity(page)
         auth_method = user_data.get('auth_method', 'unknown')
+        
+        # ВАЖНО: Для новых сессий всегда требуется авторизация
+        if not session_was_restored:
+            log_func("Создана новая сессия - требуется авторизация")
+            session_valid = False
         
         if not session_valid:
             log_func("Сесія недійсна, потрібна реавторизація")
