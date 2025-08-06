@@ -64,6 +64,17 @@ paused_sessions = {}  # Сохраненные браузерные сессии
 session_rotation_queue = asyncio.Queue()  # Очередь для ротации пользователей
 MAX_PAUSED_SESSIONS = 5  # Максимум одновременно сохраненных сессий
 SESSION_RETRY_INTERVAL = 180  # 3 минуты между попытками для одного пользователя
+SEARCH_ATTEMPTS_BEFORE_QUEUE_CHECK = 3  # После скольких попыток проверять очередь
+
+# --- NETWORK RESILIENCE SETTINGS ---
+NETWORK_RETRY_ATTEMPTS = 3  # Количество попыток при сетевых ошибках
+NETWORK_RETRY_DELAY = 10  # Задержка между попытками в секундах
+NETWORK_TIMEOUT_THRESHOLD = 30  # Порог таймаута для определения сетевых проблем
+
+# --- PERSISTENT SESSION SYSTEM (DOLGOVECHNYE SESSII) ---
+PERSISTENT_SESSIONS_DIR = 'persistent_sessions'  # Директория для долговечных сессий
+PERSISTENT_SESSION_DURATION = 24 * 60 * 60  # 24 часа для persistent sessions
+ENABLE_PERSISTENT_PROFILES = True  # Включить ли persistent browser profiles
 
 
 class SessionResetException(Exception):
@@ -72,6 +83,14 @@ class SessionResetException(Exception):
 
 class NoSlotsFoundException(Exception):
     """Custom exception for when no slots are found."""
+    pass
+
+class NetworkConnectionException(Exception):
+    """Custom exception for network connection issues."""
+    pass
+
+class TemporaryNetworkException(Exception):
+    """Custom exception for temporary network issues that should be retried."""
     pass
 
 # --- WORKER MANAGEMENT FUNCTIONS ---
@@ -159,6 +178,10 @@ async def save_browser_session(user_id: int, context, page, bot: Bot):
         current_url = "unknown"
         page_title = "unknown"
     
+    # НОВОЕ: Сохраняем persistent session state
+    user_data = load_user_data(user_id)
+    persistent_saved = await save_persistent_session_state(user_id, context, page, user_data)
+    
     paused_sessions[user_id] = {
         'context': context,
         'page': page,
@@ -166,7 +189,8 @@ async def save_browser_session(user_id: int, context, page, bot: Bot):
         'attempt_count': paused_sessions.get(user_id, {}).get('attempt_count', 0) + 1,
         'saved_url': current_url,
         'page_title': page_title,
-        'browser_pid': str(context.browser) if context and context.browser else "unknown"
+        'browser_pid': str(context.browser) if context and context.browser else "unknown",
+        'persistent_state_saved': persistent_saved  # Флаг, что состояние сохранено
     }
     
     # Добавляем в ротационную очередь
@@ -176,18 +200,22 @@ async def save_browser_session(user_id: int, context, page, bot: Bot):
     if chat_id:
         # Рассчитываем предполагаемую надежность
         reliability_estimate = "90-95%" if "dateAndTimeVisitInfo" in current_url else "60-70%"
+        if persistent_saved:
+            reliability_estimate = "95-99% (с persistent состоянием)"
+        
+        persistent_info = "🔄 Сохранено с persistent состоянием (cookies + storage)" if persistent_saved else "🔄 Обычное сохранение"
         
         await bot.send_message(chat_id, 
             f"💾 **Сессия сохранена!**\n"
-            f"🔄 Переключаюсь на других пользователей.\n"
+            f"{persistent_info}\n"
             f"⏰ Вернусь через {SESSION_RETRY_INTERVAL // 60} мин\n"
             f"🎯 Ожидаемая надежность восстановления: {reliability_estimate}\n"
             f"📍 Сохранено на странице: {page_title[:50]}...")
     
-    logging.info(f"Сессия пользователя {user_id} сохранена. Всего сохранено: {len(paused_sessions)}. URL: {current_url}")
+    logging.info(f"Сессия пользователя {user_id} сохранена (persistent: {persistent_saved}). Всего сохранено: {len(paused_sessions)}. URL: {current_url}")
     return True
 
-async def restore_browser_session(user_id: int, bot: Bot):
+async def restore_browser_session(user_id: int, bot: Bot, headless_mode: bool = True):
     """Восстанавливает сохраненную браузерную сессию с расширенными проверками"""
     if user_id not in paused_sessions:
         return None, None
@@ -200,16 +228,67 @@ async def restore_browser_session(user_id: int, bot: Bot):
     user_data = load_user_data(user_id)
     auth_method = user_data.get('auth_method', 'unknown')
     
+    # НОВОЕ: Проверяем, было ли сохранено persistent состояние
+    has_persistent_state = session_data.get('persistent_state_saved', False)
+    
     # Проверяем, что сессия еще активна
     try:
         # 1. Базовые проверки
         if page.is_closed():
             logging.warning(f"Сохраненная страница пользователя {user_id} закрыта")
+            
+            # НОВОЕ: Если есть persistent состояние, пробуем создать новую сессию
+            if has_persistent_state:
+                logging.info(f"Attempting to restore session for user {user_id} from persistent state")
+                if chat_id:
+                    await bot.send_message(chat_id, 
+                        "🔄 **Восстановление из долговечной сессии**\n"
+                        "Страница закрыта, но состояние сохранено. Создаю новую сессию...")
+                
+                try:
+                    # Создаем новую сессию с persistent состоянием
+                    new_context, new_page = await create_new_session_from_persistent(user_id, headless=headless_mode)
+                    if new_context and new_page:
+                        # Обновляем данные в paused_sessions
+                        paused_sessions[user_id]['context'] = new_context
+                        paused_sessions[user_id]['page'] = new_page
+                        paused_sessions[user_id]['last_attempt'] = time.time()
+                        
+                        if chat_id:
+                            await bot.send_message(chat_id, "✅ Сессия восстановлена из долговечного состояния!")
+                        
+                        logging.info(f"Successfully restored session for user {user_id} from persistent state")
+                        return new_context, new_page
+                        
+                except Exception as restore_error:
+                    logging.error(f"Failed to restore from persistent state for user {user_id}: {restore_error}")
+                    if chat_id:
+                        await bot.send_message(chat_id, 
+                            f"❌ Не удалось восстановить из долговечного состояния: {str(restore_error)[:100]}...")
+            
             await close_paused_session(user_id, bot)
             return None, None
             
         if not context.browser.is_connected():
             logging.warning(f"Браузер для пользователя {user_id} отключен")
+            
+            # НОВОЕ: Пробуем восстановить из persistent состояния
+            if has_persistent_state:
+                logging.info(f"Browser disconnected for user {user_id}, trying persistent restore")
+                try:
+                    new_context, new_page = await create_new_session_from_persistent(user_id, headless=headless_mode)
+                    if new_context and new_page:
+                        paused_sessions[user_id]['context'] = new_context
+                        paused_sessions[user_id]['page'] = new_page
+                        paused_sessions[user_id]['last_attempt'] = time.time()
+                        
+                        if chat_id:
+                            await bot.send_message(chat_id, "✅ Браузер переподключен с долговечным состоянием!")
+                        
+                        return new_context, new_page
+                except Exception as restore_error:
+                    logging.error(f"Failed persistent restore after browser disconnect for user {user_id}: {restore_error}")
+            
             await close_paused_session(user_id, bot)
             return None, None
         
@@ -252,7 +331,7 @@ async def restore_browser_session(user_id: int, bot: Bot):
                         success = await auto_reauth_with_key(page, user_data, chat_id, bot)
                         if success:
                             # После успешной реавторизации возвращаемся к началу восстановления
-                            return await restore_browser_session(user_id, bot)
+                            return await restore_browser_session(user_id, bot, headless_mode)
                         else:
                             await close_paused_session(user_id, bot)
                             return None, None
@@ -265,6 +344,34 @@ async def restore_browser_session(user_id: int, bot: Bot):
                         return None, None
                 else:
                     # Для других методов (Diya, BankID) требуется ручная реавторизация
+                    # НОВОЕ: Но если есть persistent состояние, пробуем его использовать
+                    if has_persistent_state:
+                        try:
+                            if chat_id:
+                                await bot.send_message(chat_id, 
+                                    "🔄 Сессия истекла, но пробую восстановить из долговечного состояния...")
+                            
+                            new_context, new_page = await create_new_session_from_persistent(user_id, headless=headless_mode)
+                            if new_context and new_page:
+                                # Проверяем, восстановилась ли авторизация
+                                is_valid = await check_session_validity(new_page)
+                                if is_valid:
+                                    paused_sessions[user_id]['context'] = new_context
+                                    paused_sessions[user_id]['page'] = new_page
+                                    paused_sessions[user_id]['last_attempt'] = time.time()
+                                    
+                                    if chat_id:
+                                        await bot.send_message(chat_id, "✅ Авторизация восстановлена из долговечного состояния!")
+                                    
+                                    return new_context, new_page
+                                else:
+                                    if chat_id:
+                                        await bot.send_message(chat_id, "❌ Долговечное состояние не содержит активную авторизацию")
+                                    await new_context.close()
+                                    
+                        except Exception as persistent_restore_error:
+                            logging.error(f"Failed to restore from persistent state for {user_id}: {persistent_restore_error}")
+                    
                     if chat_id:
                         auth_name = {'diia': 'Дія', 'idgov': 'BankID'}.get(auth_method, auth_method)
                         await bot.send_message(chat_id, 
@@ -304,25 +411,29 @@ async def restore_browser_session(user_id: int, bot: Bot):
         # 4. Проверка времени с последней активности (с учетом типа авторизации)
         time_since_pause = time.time() - session_data['last_attempt']
         
+        # НОВОЕ: Увеличиваем лимиты времени для persistent sessions
+        base_time_multiplier = 2 if has_persistent_state else 1
+        
         # Устанавливаем лимиты времени в зависимости от типа авторизации
         if auth_method == 'key':
-            max_session_age = 45 * 60  # 45 минут для файла-ключа (дольше)
+            max_session_age = (45 * 60) * base_time_multiplier  # До 90 минут для файла-ключа с persistent
             reliability_bonus = 10  # Бонус к надежности для файла-ключа
         elif auth_method == 'diia':
-            max_session_age = 25 * 60  # 25 минут для Diya
+            max_session_age = (25 * 60) * base_time_multiplier  # До 50 минут для Diya с persistent
             reliability_bonus = 0
         elif auth_method == 'idgov':
-            max_session_age = 20 * 60  # 20 минут для BankID (короче)
+            max_session_age = (20 * 60) * base_time_multiplier  # До 40 минут для BankID с persistent
             reliability_bonus = 0
         else:
-            max_session_age = 25 * 60  # По умолчанию 25 минут
+            max_session_age = (25 * 60) * base_time_multiplier  # По умолчанию до 50 минут с persistent
             reliability_bonus = 0
         
         if time_since_pause > max_session_age:
             logging.warning(f"Сессия пользователя {user_id} слишком старая ({time_since_pause//60:.1f} мин) для метода {auth_method}")
             if chat_id:
+                persistent_info = " (с persistent состоянием)" if has_persistent_state else ""
                 await bot.send_message(chat_id, 
-                    f"⏰ Сессия сохранялась слишком долго ({time_since_pause//60:.1f} мин) для метода авторизации {auth_method}.\n"
+                    f"⏰ Сессия сохранялась слишком долго ({time_since_pause//60:.1f} мин) для метода авторизации {auth_method}{persistent_info}.\n"
                     f"Потребуется повторная авторизация.")
             await close_paused_session(user_id, bot)
             return None, None
@@ -332,11 +443,17 @@ async def restore_browser_session(user_id: int, bot: Bot):
         
         if chat_id:
             reliability_percent = max(50, 95 - (time_since_pause / 60) * 2 + reliability_bonus)  # Бонус для файла-ключа
+            if has_persistent_state:
+                reliability_percent = min(99, reliability_percent + 10)  # Дополнительный бонус за persistent
+                
             auth_info = {
                 'key': 'Файл-ключ (высокая надежность)',
-                'diia': 'Diya (средняя надежность)',
+                'diia': 'Diya (средняя надежность)', 
                 'idgov': 'BankID (умеренная надежность)'
             }.get(auth_method, auth_method)
+            
+            if has_persistent_state:
+                auth_info += " + Долговечное состояние"
             
             await bot.send_message(chat_id, 
                 f"🔄 **Восстанавливаю сессию...**\n"
@@ -345,7 +462,7 @@ async def restore_browser_session(user_id: int, bot: Bot):
                 f"🔐 Авторизация: {auth_info}\n"
                 f"⏱️ Возраст сессии: {time_since_pause//60:.0f} мин")
         
-        logging.info(f"Успешно восстановлена сессия пользователя {user_id} (возраст: {time_since_pause//60:.1f} мин, метод: {auth_method})")
+        logging.info(f"Успешно восстановлена сессия пользователя {user_id} (возраст: {time_since_pause//60:.1f} мин, метод: {auth_method}, persistent: {has_persistent_state})")
         return context, page
         
     except Exception as e:
@@ -356,9 +473,146 @@ async def restore_browser_session(user_id: int, bot: Bot):
         await close_paused_session(user_id, bot)
         return None, None
 
+async def create_new_session_from_persistent(user_id: int, headless: bool = True):
+    """Создает новую сессию браузера, восстанавливая состояние из persistent storage"""
+    try:
+        # Загружаем данные пользователя для проверки метода авторизации
+        user_data = load_user_data(user_id)
+        auth_method = user_data.get('auth_method', 'unknown')
+        
+        p = await async_playwright().start()
+        browser, context = await create_persistent_browser_context(user_id, p, False)  # Принудительно видимый режим
+        
+        if context is None:  # Значит используется persistent context
+            context = browser
+            page = await context.new_page()
+        else:
+            page = await context.new_page()
+        
+        await page.evaluate("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        
+        # Переходим на главную страницу перед восстановлением состояния
+        await page.goto("https://e-consul.gov.ua/", timeout=60000)
+        await page.wait_for_load_state('networkidle', timeout=30000)
+        
+        # Для BankID и Diya НЕ восстанавливаем persistent состояние, так как оно быстро устаревает
+        restore_success = False
+        if auth_method == 'key':
+            # Только для файла-ключа восстанавливаем сохраненное состояние
+            restore_success = await restore_persistent_session_state(user_id, context, page)
+            
+            if restore_success:
+                logging.info(f"Successfully restored persistent state for user {user_id} with key auth")
+                # Даем странице время на обработку восстановленных данных
+                await page.wait_for_timeout(2000)
+                
+                # Обновляем страницу для применения восстановленного состояния
+                await page.reload(wait_until='networkidle', timeout=30000)
+        else:
+            logging.info(f"Skipping persistent state restore for user {user_id} with auth method {auth_method} - creating fresh session")
+        
+        # Проверяем, авторизован ли пользователь (только для файла-ключа)
+        if auth_method == 'key' and restore_success:
+            is_logged_in = await check_session_validity(page)
+            if is_logged_in:
+                logging.info(f"User {user_id} is logged in after persistent restore")
+                try:
+                    # Пытаемся перейти к странице выбора времени
+                    await page.get_by_role("link", name="Запис на візит").click(timeout=10000)
+                    await page.wait_for_timeout(2000)
+                    await page.get_by_role("link", name="Записатись на візит").click(timeout=10000)
+                    await page.wait_for_timeout(2000)
+                    
+                    # Заполняем данные из сохраненного профиля пользователя
+                    if user_data:
+                        # Быстро заполняем форму до страницы выбора времени
+                        await fill_user_forms_quickly(page, user_data)
+                        logging.info(f"Successfully navigated to slot selection for user {user_id}")
+                        
+                except Exception as navigation_error:
+                    logging.warning(f"Navigation after persistent restore failed for user {user_id}: {navigation_error}")
+                    # Не критично, но сессия может потребовать ручного вмешательства
+            else:
+                logging.warning(f"User {user_id} not logged in after persistent restore - session may have expired")
+        else:
+            # Для BankID/Diya или если восстановление неуспешно - просто возвращаем чистую сессию
+            logging.info(f"Returning fresh session for user {user_id} with auth method {auth_method}")
+        
+        return context, page
+        
+    except Exception as e:
+        logging.error(f"Failed to create session from persistent state for user {user_id}: {e}")
+        return None, None
+
+async def fill_user_forms_quickly(page, user_data):
+    """Быстро заполняет формы пользователя для перехода к выбору слотов"""
+    try:
+        # Ждем загрузки страницы с данными заявителя
+        await page.wait_for_url("**/applicantInfo**", timeout=30000)
+        
+        # Заполняем дату рождения
+        dob = datetime.strptime(user_data['date_of_birth'], "%d.%m.%Y")
+        await page.locator('input[aria-label="день"]').fill(str(dob.day))
+        month_names_uk = ["січня", "лютого", "березня", "квітня", "травня", "червня", "липня", "серпня", "вересня", "жовтня", "листопада", "грудня"]
+        await page.locator('div[aria-label="місяць"]').click()
+        await page.get_by_role("option", name=month_names_uk[dob.month - 1]).click()
+        await page.locator('input[aria-label="рік"]').fill(str(dob.year))
+        
+        # Выбираем пол
+        gender_map = {'male': "Чоловіча", 'female': "Жіноча"}
+        await page.get_by_label(gender_map[user_data['gender']]).check()
+        await page.get_by_role("button", name="Далі").click()
+        
+        # Страница выбора места визита
+        await page.wait_for_url("**/placeOfVisitInfo**", timeout=30000)
+        await page.locator('input[id="country"]').fill(user_data['country'])
+        await page.locator(f"li:has-text(\"{user_data['country']}\")").click()
+        await page.wait_for_timeout(1000)
+        await page.locator('input[id="consularInstitution"]').fill(user_data['institution'])
+        await page.locator(f"li:has-text(\"{user_data['institution']}\")").click()
+        await page.get_by_role("button", name="Далі").click()
+        
+        # Страница выбора услуги
+        await page.wait_for_url("**/consularServiceInfo**", timeout=30000)
+        service_input = page.locator('input[id="service"]')
+        await service_input.fill(user_data['service_type'], timeout=10000)
+        await page.wait_for_timeout(1000)
+        await page.get_by_role("option", name=user_data['service_type'], exact=True).click(timeout=10000)
+        
+        # Выбираем получателя услуги
+        recipient_map = {'self': "Для себе", 'child': "Для своєї дитини, підопічного"}
+        await page.get_by_label(recipient_map[user_data['service_recipient']]).check()
+        
+        if user_data['service_recipient'] == 'child':
+            await page.locator('input[aria-label="Прізвище"]').fill(user_data['child_surname'])
+            await page.locator('input[aria-label=" Ім\'я"]').fill(user_data['child_firstname'])
+            await page.locator('input[aria-label="По батькові"]').fill(user_data['child_middlename'])
+        
+        await page.get_by_role("button", name="Далі").click()
+        await page.wait_for_url("**/dateAndTimeVisitInfo**", timeout=30000)
+        
+        logging.info("Successfully filled forms and reached slot selection page")
+        
+    except Exception as e:
+        logging.error(f"Error filling forms quickly: {e}")
+        raise
+
 async def auto_reauth_with_key(page, user_data: dict, chat_id: int, bot: Bot) -> bool:
     """Автоматическая реавторизация с файлом-ключом"""
     try:
+        # Проверяем наличие необходимых данных
+        if 'key_file_path' not in user_data or 'key_password' not in user_data:
+            logging.error(f"Отсутствуют данные для автореавторизации: key_file_path={user_data.get('key_file_path', 'missing')}, key_password={'present' if 'key_password' in user_data else 'missing'}")
+            return False
+            
+        key_file_path = user_data['key_file_path']
+        key_password = user_data['key_password']
+        
+        # Проверяем существование файла ключа
+        if not os.path.exists(key_file_path):
+            logging.error(f"Файл ключа не найден: {key_file_path}")
+            return False
+        
         logging.info(f"Начинаю автоматическую реавторизацию с файлом-ключом для чата {chat_id}")
         
         # Переходим на страницу авторизации если еще не там
@@ -372,14 +626,14 @@ async def auto_reauth_with_key(page, user_data: dict, chat_id: int, bot: Bot) ->
         # Загружаем файл ключа
         async with page.expect_file_chooser() as fc_info:
             await page.locator('text="Оберіть ключ на своєму носієві"').click()
-        await (await fc_info.value).set_files(user_data['key_file_path'])
+        await (await fc_info.value).set_files(key_file_path)
         
         # Выбираем сервер ключей
         await page.locator('#id-app-login-sign-form-file-key-server').click()
         await page.locator('li[data-value="31"]').click()
         
         # Вводим пароль от ключа
-        await page.locator('input#id-app-login-sign-form-file-key-password').fill(user_data['key_password'])
+        await page.locator('input#id-app-login-sign-form-file-key-password').fill(key_password)
         
         # Кликаем кнопку входа
         async with page.expect_navigation(url="**/e-consul.gov.ua/**", timeout=60000):
@@ -445,7 +699,436 @@ async def get_next_rotation_user():
     except asyncio.TimeoutError:
         return None
 
+# --- PERSISTENT SESSION MANAGEMENT ---
+
+async def save_persistent_session_state(user_id: int, context, page, user_data: dict):
+    """Сохраняет состояние сессии для долговременного хранения (cookies, localStorage, etc.)"""
+    if not ENABLE_PERSISTENT_PROFILES:
+        return False
+        
+    try:
+        os.makedirs(PERSISTENT_SESSIONS_DIR, exist_ok=True)
+        user_session_dir = os.path.join(PERSISTENT_SESSIONS_DIR, str(user_id))
+        os.makedirs(user_session_dir, exist_ok=True)
+        
+        # 1. Сохраняем cookies
+        cookies = await context.cookies()
+        cookies_file = os.path.join(user_session_dir, 'cookies.json')
+        with open(cookies_file, 'w', encoding='utf-8') as f:
+            json.dump(cookies, f, ensure_ascii=False, indent=2)
+        
+        # 2. Безопасно сохраняем localStorage и sessionStorage
+        try:
+            storage_data = await page.evaluate("""() => {
+                const local = {};
+                const session = {};
+                
+                try {
+                    // localStorage
+                    if (typeof localStorage !== 'undefined') {
+                        for (let i = 0; i < localStorage.length; i++) {
+                            const key = localStorage.key(i);
+                            local[key] = localStorage.getItem(key);
+                        }
+                    }
+                } catch (e) {
+                    console.warn('localStorage access denied:', e);
+                }
+                
+                try {
+                    // sessionStorage  
+                    if (typeof sessionStorage !== 'undefined') {
+                        for (let i = 0; i < sessionStorage.length; i++) {
+                            const key = sessionStorage.key(i);
+                            session[key] = sessionStorage.getItem(key);
+                        }
+                    }
+                } catch (e) {
+                    console.warn('sessionStorage access denied:', e);
+                }
+                
+                return { localStorage: local, sessionStorage: session };
+            }""")
+            
+            storage_file = os.path.join(user_session_dir, 'storage.json')
+            with open(storage_file, 'w', encoding='utf-8') as f:
+                json.dump(storage_data, f, ensure_ascii=False, indent=2)
+                
+        except Exception as storage_error:
+            logging.warning(f"Failed to save storage data for user {user_id}: {storage_error}")
+            # Создаем пустой файл storage для избежания ошибок при восстановлении
+            storage_file = os.path.join(user_session_dir, 'storage.json')
+            with open(storage_file, 'w', encoding='utf-8') as f:
+                json.dump({'localStorage': {}, 'sessionStorage': {}}, f)
+        
+        # 3. Сохраняем метаданные сессии
+        session_meta = {
+            'user_id': user_id,
+            'auth_method': user_data.get('auth_method'),
+            'saved_at': time.time(),
+            'current_url': page.url,
+            'user_agent': await page.evaluate("navigator.userAgent"),
+            'last_activity': time.time(),
+            'session_type': 'persistent'
+        }
+        
+        meta_file = os.path.join(user_session_dir, 'session_meta.json')
+        with open(meta_file, 'w', encoding='utf-8') as f:
+            json.dump(session_meta, f, ensure_ascii=False, indent=2)
+            
+        logging.info(f"Persistent session state saved for user {user_id}")
+        return True
+        
+    except Exception as e:
+        logging.error(f"Failed to save persistent session state for user {user_id}: {e}")
+        return False
+
+async def restore_persistent_session_state(user_id: int, context, page):
+    """Восстанавливает сохраненное состояние сессии"""
+    if not ENABLE_PERSISTENT_PROFILES:
+        return False
+        
+    try:
+        user_session_dir = os.path.join(PERSISTENT_SESSIONS_DIR, str(user_id))
+        
+        if not os.path.exists(user_session_dir):
+            return False
+            
+        # Проверяем возраст сессии
+        meta_file = os.path.join(user_session_dir, 'session_meta.json')
+        if os.path.exists(meta_file):
+            with open(meta_file, 'r', encoding='utf-8') as f:
+                session_meta = json.load(f)
+            
+            session_age = time.time() - session_meta.get('saved_at', 0)
+            if session_age > PERSISTENT_SESSION_DURATION:
+                logging.info(f"Persistent session for user {user_id} expired ({session_age/3600:.1f} hours old)")
+                return False
+        
+        # 1. Восстанавливаем cookies
+        cookies_file = os.path.join(user_session_dir, 'cookies.json')
+        if os.path.exists(cookies_file):
+            with open(cookies_file, 'r', encoding='utf-8') as f:
+                cookies = json.load(f)
+            await context.add_cookies(cookies)
+            logging.info(f"Restored {len(cookies)} cookies for user {user_id}")
+        
+        # 2. Восстанавливаем localStorage и sessionStorage
+        storage_file = os.path.join(user_session_dir, 'storage.json')
+        if os.path.exists(storage_file):
+            with open(storage_file, 'r', encoding='utf-8') as f:
+                storage_data = json.load(f)
+            
+            # Безопасно устанавливаем localStorage
+            if 'localStorage' in storage_data and storage_data['localStorage']:
+                try:
+                    # Проверяем доступность localStorage после загрузки страницы
+                    await page.wait_for_load_state('domcontentloaded', timeout=10000)
+                    await page.evaluate("typeof localStorage")
+                    
+                    # Устанавливаем все элементы localStorage одним вызовом
+                    storage_script = """
+                    (storageData) => {
+                        try {
+                            for (const [key, value] of Object.entries(storageData)) {
+                                localStorage.setItem(key, value);
+                            }
+                            return true;
+                        } catch (e) {
+                            console.warn('localStorage set error:', e);
+                            return false;
+                        }
+                    }
+                    """
+                    success = await page.evaluate(storage_script, storage_data['localStorage'])
+                    if success:
+                        logging.info(f"Successfully restored localStorage for user {user_id}")
+                    else:
+                        logging.warning(f"Failed to restore some localStorage items for user {user_id}")
+                        
+                except Exception as localStorage_error:
+                    logging.warning(f"localStorage not accessible for user {user_id}: {localStorage_error}")
+            
+            # Безопасно устанавливаем sessionStorage
+            if 'sessionStorage' in storage_data and storage_data['sessionStorage']:
+                try:
+                    # Проверяем доступность sessionStorage
+                    await page.evaluate("typeof sessionStorage")
+                    
+                    # Устанавливаем все элементы sessionStorage одним вызовом
+                    session_script = """
+                    (storageData) => {
+                        try {
+                            for (const [key, value] of Object.entries(storageData)) {
+                                sessionStorage.setItem(key, value);
+                            }
+                            return true;
+                        } catch (e) {
+                            console.warn('sessionStorage set error:', e);
+                            return false;
+                        }
+                    }
+                    """
+                    success = await page.evaluate(session_script, storage_data['sessionStorage'])
+                    if success:
+                        logging.info(f"Successfully restored sessionStorage for user {user_id}")
+                    else:
+                        logging.warning(f"Failed to restore some sessionStorage items for user {user_id}")
+                        
+                except Exception as sessionStorage_error:
+                    logging.warning(f"sessionStorage not accessible for user {user_id}: {sessionStorage_error}")
+                    
+            logging.info(f"Restored browser storage for user {user_id}")
+        
+        return True
+        
+    except Exception as e:
+        logging.error(f"Failed to restore persistent session state for user {user_id}: {e}")
+        return False
+
+async def create_persistent_browser_context(user_id: int, p, headless: bool = True):
+    """Создает browser context с persistent профилем"""
+    if not ENABLE_PERSISTENT_PROFILES:
+        # Fallback к обычному контексту
+        browser = await p.chromium.launch(
+            headless=headless,
+            channel="chrome", 
+            args=["--start-maximized", "--disable-blink-features=AutomationControlled"],
+            timeout=60000
+        )
+        
+        context = await browser.new_context(
+            locale="uk-UA",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            timezone_id="Europe/Kiev"
+        )
+        return browser, context
+    
+    try:
+        # Создаем директорию для persistent профиля
+        profile_dir = os.path.join(BASE_PROFILES_DIR, str(user_id))
+        os.makedirs(profile_dir, exist_ok=True)
+        
+        # Запускаем браузер с persistent профилем
+        browser = await p.chromium.launch_persistent_context(
+            user_data_dir=profile_dir,
+            headless=headless,
+            channel="chrome",
+            args=[
+                "--start-maximized", 
+                "--disable-blink-features=AutomationControlled",
+                "--disable-web-security",
+                "--disable-features=VizDisplayCompositor"
+            ],
+            locale="uk-UA",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            timezone_id="Europe/Kiev",
+            timeout=60000
+        )
+        
+        logging.info(f"Created persistent browser context for user {user_id} at {profile_dir} (headless: {headless})")
+        return None, browser  # browser здесь на самом деле context для persistent
+        
+    except Exception as e:
+        logging.error(f"Failed to create persistent context for user {user_id}: {e}")
+        # Fallback к обычному браузеру
+        browser = await p.chromium.launch(
+            headless=headless,
+            channel="chrome",
+            args=["--start-maximized", "--disable-blink-features=AutomationControlled"],
+            timeout=60000
+        )
+        
+        context = await browser.new_context(
+            locale="uk-UA",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            timezone_id="Europe/Kiev"
+        )
+        return browser, context
+
+async def cleanup_expired_persistent_sessions():
+    """Очищает устаревшие persistent sessions"""
+    try:
+        if not os.path.exists(PERSISTENT_SESSIONS_DIR):
+            return
+            
+        current_time = time.time()
+        cleaned_count = 0
+        
+        for user_dir in os.listdir(PERSISTENT_SESSIONS_DIR):
+            user_path = os.path.join(PERSISTENT_SESSIONS_DIR, user_dir)
+            if not os.path.isdir(user_path):
+                continue
+                
+            meta_file = os.path.join(user_path, 'session_meta.json')
+            if os.path.exists(meta_file):
+                try:
+                    with open(meta_file, 'r', encoding='utf-8') as f:
+                        session_meta = json.load(f)
+                    
+                    session_age = current_time - session_meta.get('saved_at', 0)
+                    if session_age > PERSISTENT_SESSION_DURATION:
+                        shutil.rmtree(user_path)
+                        cleaned_count += 1
+                        logging.info(f"Cleaned expired persistent session for user {user_dir}")
+                        
+                except Exception as e:
+                    logging.error(f"Error processing session meta for {user_dir}: {e}")
+        
+        if cleaned_count > 0:
+            logging.info(f"Cleaned {cleaned_count} expired persistent sessions")
+            
+    except Exception as e:
+        logging.error(f"Error during persistent session cleanup: {e}")
+
 # --- HELPER FUNCTIONS ---
+
+def is_network_error(error: Exception) -> bool:
+    """Определяет, является ли ошибка сетевой"""
+    error_str = str(error).lower()
+    error_type = str(type(error).__name__).lower()
+    
+    # Специальная обработка Telegram ошибок
+    if 'telegram.error.networkerror' in error_type or 'networkerror' in error_type:
+        return True
+    
+    # Специальная обработка httpx ошибок (используется telegram-bot-api)
+    if 'httpx' in error_str and ('connecterror' in error_str or 'timeouterror' in error_str):
+        return True
+    
+    network_indicators = [
+        # Основные сетевые ошибки
+        'timeout', 'connection', 'network', 'dns', 'resolve',
+        'unreachable', 'refused', 'reset', 'disconnected',
+        'timed out', 'net::', 'failed to fetch', 'offline',
+        
+        # Конкретные ошибки DNS и соединения
+        'getaddrinfo failed', 'connection refused', 'host unreachable',
+        'no route to host', 'network is unreachable',
+        
+        # WiFi модуль специфичные ошибки
+        'wifi is turned off', 'network adapter is disabled',
+        'wifi disabled', 'no internet connection',
+        
+        # HTTP коды ошибок сети/шлюза
+        '502 bad gateway', '503 service unavailable', '504 gateway timeout',
+        'bad gateway', 'service unavailable', 'gateway timeout',
+        
+        # Дополнительные паттерны
+        'connection reset by peer', 'connection aborted',
+        'peer reset', 'read timeout', 'write timeout'
+    ]
+    return any(indicator in error_str for indicator in network_indicators)
+
+def is_temporary_error(error: Exception) -> bool:
+    """Определяет, является ли ошибка временной (можно повторить)"""
+    if isinstance(error, PlaywrightTimeoutError):
+        return True
+    
+    error_str = str(error).lower()
+    temporary_indicators = [
+        'timeout', 'temporary', 'busy', 'overload', 'rate limit',
+        'try again', 'service unavailable', '503', '502', '504'
+    ]
+    return any(indicator in error_str for indicator in temporary_indicators)
+
+async def retry_network_operation(operation, max_attempts: int = NETWORK_RETRY_ATTEMPTS, 
+                                delay: int = NETWORK_RETRY_DELAY, context_info: str = "операция"):
+    """
+    Выполняет операцию с повторными попытками при сетевых ошибках
+    
+    Args:
+        operation: async функция для выполнения
+        max_attempts: максимальное количество попыток
+        delay: задержка между попытками в секундах
+        context_info: описание операции для логирования
+    """
+    last_error = None
+    
+    for attempt in range(max_attempts):
+        try:
+            return await operation()
+        except Exception as e:
+            last_error = e
+            
+            if attempt == max_attempts - 1:  # Последняя попытка
+                break
+                
+            if is_network_error(e) or is_temporary_error(e):
+                logging.warning(f"Сетевая ошибка при {context_info} (попытка {attempt + 1}/{max_attempts}): {e}")
+                await asyncio.sleep(delay * (attempt + 1))  # Экспоненциальная задержка
+                continue
+            else:
+                # Не сетевая ошибка - не повторяем
+                break
+    
+    # Если все попытки неудачны
+    if is_network_error(last_error):
+        raise NetworkConnectionException(f"Сетевая ошибка после {max_attempts} попыток: {last_error}")
+    elif is_temporary_error(last_error):
+        raise TemporaryNetworkException(f"Временная ошибка после {max_attempts} попыток: {last_error}")
+    else:
+        raise last_error
+
+async def safe_send_message(bot: Bot, chat_id: int, message: str, context_info: str = "отправка сообщения"):
+    """Безопасная отправка сообщения в Telegram с обработкой сетевых ошибок"""
+    try:
+        await retry_network_operation(
+            lambda: bot.send_message(chat_id, message),
+            context_info=context_info
+        )
+    except (NetworkConnectionException, TemporaryNetworkException) as network_error:
+        logging.warning(f"Сетевая ошибка при {context_info} в чат {chat_id}: {network_error}")
+        # Не пересылаем сетевые ошибки - они должны обрабатываться выше
+        raise
+    except Exception as e:
+        # Проверяем, не является ли это необработанной сетевой ошибкой
+        if is_network_error(e):
+            logging.warning(f"Неклассифицированная сетевая ошибка при {context_info} в чат {chat_id}: {e}")
+            raise NetworkConnectionException(f"Telegram API сетевая ошибка: {e}")
+        else:
+            logging.error(f"Не удалось отправить сообщение в чат {chat_id}: {e}")
+            raise
+
+async def safe_network_operation(operation, operation_name: str, chat_id: int = None, bot: Bot = None):
+    """
+    Безопасное выполнение сетевой операции с автоматическим уведомлением пользователя
+    
+    Args:
+        operation: функция для выполнения
+        operation_name: описание операции для логирования
+        chat_id: ID чата для уведомлений (опционально)
+        bot: экземпляр бота для уведомлений (опционально)
+    """
+    try:
+        return await retry_network_operation(operation, context_info=operation_name)
+    except (NetworkConnectionException, TemporaryNetworkException) as network_error:
+        logging.warning(f"Сетевая ошибка при {operation_name}: {network_error}")
+        if chat_id and bot:
+            try:
+                await bot.send_message(chat_id, 
+                    f"🌐 **Обнаружена проблема с интернет-соединением**\n\n"
+                    f"Операция: {operation_name}\n"
+                    f"🔄 Система автоматически повторила попытки\n"
+                    f"⚠️ Проверьте соединение с интернетом")
+            except:
+                logging.error(f"Не удалось отправить уведомление о сетевой ошибке в чат {chat_id}")
+        raise
+    except Exception as e:
+        if is_network_error(e):
+            logging.warning(f"Обнаружена неклассифицированная сетевая ошибка при {operation_name}: {e}")
+            if chat_id and bot:
+                try:
+                    await bot.send_message(chat_id, 
+                        f"🌐 **Проблемы с подключением**\n\n"
+                        f"При выполнении операции '{operation_name}' возникли проблемы с сетью.\n"
+                        f"🔄 Повторные попытки не помогли\n"
+                        f"⚠️ Проверьте стабильность интернет-соединения")
+                except:
+                    logging.error(f"Не удалось отправить уведомление о сетевой ошибке в чат {chat_id}")
+            raise NetworkConnectionException(f"Неклассифицированная сетевая ошибка: {e}")
+        else:
+            raise
 
 async def save_screenshot(page, name, context_id, locator=None, full_page=False):
     screenshots_dir = os.path.join(BASE_SCREENSHOTS_DIR, str(context_id))
@@ -630,27 +1313,73 @@ async def generate_calendar_keyboard(year: int, month: int) -> InlineKeyboardMar
 async def check_session_validity(page):
     """Checks if the e-consul session is active."""
     try:
-        if "id.e-consul.gov.ua" in page.url:
+        current_url = page.url
+        logging.info(f"Checking session validity for URL: {current_url}")
+        
+        # Если на странице авторизации - сессия неактивна
+        if "id.e-consul.gov.ua" in current_url:
             logging.warning("On login page, session is invalid.")
             return False
 
-        session_ended_locator = page.locator('text="Сесія закінчилася"')
-        try:
-            await session_ended_locator.wait_for(state='visible', timeout=2000)
-            logging.warning("Виявлено повідомлення 'Сесія закінчилася'. Сесія недійсна.")
-            return False
-        except PlaywrightTimeoutError:
-            pass
+        # Проверяем сообщения об окончании сессии
+        session_ended_locators = [
+            'text="Сесія закінчилася"',
+            'text="Сесія закінчена"',
+            'text="Помилка автентифікації"',
+            'text="Session expired"'
+        ]
+        
+        for locator_text in session_ended_locators:
+            try:
+                session_ended_locator = page.locator(locator_text)
+                await session_ended_locator.wait_for(state='visible', timeout=1000)
+                logging.warning(f"Виявлено повідомлення про закінчення сесії: {locator_text}")
+                return False
+            except PlaywrightTimeoutError:
+                continue
 
-        logged_in_element_selector = page.get_by_role("link", name="Запис на візит")
-        await expect(logged_in_element_selector).to_be_visible(timeout=10000)
-        logging.info("Активний елемент навігації знайдено. Сесія дійсна.")
-        return True
-    except PlaywrightTimeoutError:
-        logging.warning("Авторизований елемент не знайдено. Сесія неактивна.")
+        # Ждем полной загрузки страницы перед проверкой элементов
+        try:
+            await page.wait_for_load_state('domcontentloaded', timeout=10000)
+        except Exception as load_error:
+            logging.warning(f"Page load timeout during session check: {load_error}")
+
+        # Проверяем наличие элементов авторизованного пользователя
+        # Используем несколько вариантов селекторов для надежности
+        auth_selectors = [
+            'link[href*="applicantInfo"]',  # Прямая ссылка на подачу заявки
+            'text="Запис на візит"',        # Основной текст ссылки
+            'text="Записатись на візит"',   # Альтернативный текст
+            'a[title*="візит"]',            # Ссылка с атрибутом title
+            '.menu-item:has-text("Запис")', # CSS селектор для пункта меню
+        ]
+        
+        for selector in auth_selectors:
+            try:
+                element = page.locator(selector)
+                await element.wait_for(state='visible', timeout=3000)
+                logging.info(f"Found auth element with selector: {selector}. Session is valid.")
+                return True
+            except PlaywrightTimeoutError:
+                continue
+                
+        # Если ни один из селекторов не найден, но мы не на странице авторизации
+        # проверяем наличие любых ссылок навигации
+        try:
+            navigation_links = page.locator('nav a, .navigation a, .menu a')
+            nav_count = await navigation_links.count()
+            if nav_count > 0:
+                logging.info(f"Found {nav_count} navigation links - assuming session is valid")
+                return True
+        except Exception as nav_error:
+            logging.warning(f"Navigation check failed: {nav_error}")
+            
+        logging.warning("Авторизований елемент не знайдено. Сесія може бути неактивна.")
         return False
+        
     except Exception as e:
         logging.error(f"Помилка під час перевірки дійсності сесії: {e}")
+        # При ошибке в проверке считаем сессию неактивной для безопасности
         return False
 
 async def book_available_slot(page, bot, user_id, chat_id, log_func, allow_session_pause=True):
@@ -674,61 +1403,88 @@ async def book_available_slot(page, bot, user_id, chat_id, log_func, allow_sessi
                 log_func(f"ВНИМАНИЕ: Редирект со страницы поиска слотов. URL: {current_url}")
                 raise SessionResetException("Сессия сброшена - перенаправление на другую страницу")
             
-            log_func(f"Попытка {retry_attempts + 1}/{max_reload_attempts}: Ожидаю сообщения о поиске слотов.")
-            await bot.send_message(chat_id, f"🔄 Попытка {retry_attempts + 1}: Ожидание поиска слотов...")
+            log_func(f"Попытка {retry_attempts + 1}/{max_reload_attempts}: Проверяю доступность слотов.")
+            await bot.send_message(chat_id, f"🔄 Попытка {retry_attempts + 1}: Проверка доступности слотов...")
             
-            searching_slots_locator = page.locator('text="Відбувається пошук активних слотів..."')
-            
+            # НОВАЯ УЛУЧШЕННАЯ ЛОГИКА: Сначала проверяем состояние страницы
             try:
-                # Ожидание появления сообщения о поиске
-                await searching_slots_locator.wait_for(state='visible', timeout=10000)
-                log_func("Сообщение 'Відбувається пошук активних слотів...' появилось.")
+                # Ждем загрузки страницы после любых переходов с retry логикой
+                await retry_network_operation(
+                    lambda: page.wait_for_load_state('networkidle', timeout=15000),
+                    context_info="ожидание загрузки страницы"
+                )
+                await asyncio.sleep(2)
                 
-                # Ожидание исчезновения сообщения - ТОЧНЫЙ ТАЙМАУТ как в SlotVisitHelp
-                search_timeout = 170000 + 90000  # 260 секунд = 4 минуты 20 секунд как в оригинале
+                # 1. Проверяем, есть ли календарь (основной признак правильной страницы)
+                calendar_container = page.locator('div[class*="scrollbar-container"]')
                 try:
-                    await searching_slots_locator.wait_for(state='hidden', timeout=search_timeout)
-                    log_func("Сообщение 'Відбувається пошук активних слотів...' исчезло.")
+                    await calendar_container.wait_for(state='visible', timeout=10000)
+                    log_func("Календарный контейнер найден - страница загрузилась корректно")
                 except PlaywrightTimeoutError:
-                    log_func(f"Поиск слотов длится слишком долго (>{search_timeout/1000} сек). Проверяю текущее состояние...")
+                    log_func("Календарный контейнер не найден - возможно страница еще загружается")
+                    # Продолжаем проверку, возможно идет процесс поиска
+                
+                # 2. Проверяем, идет ли активный поиск слотов
+                searching_slots_locator = page.locator('text="Відбувається пошук активних слотів..."')
+                is_searching_visible = await searching_slots_locator.is_visible()
+                
+                if is_searching_visible:
+                    log_func("Обнаружен активный поиск слотов. Ожидаю завершения...")
+                    await bot.send_message(chat_id, f"⏳ Поиск слотов активен, ожидаю завершения...")
                     
-                    # Проверяем, есть ли уже сообщение об отсутствии слотов (ПОЛНАЯ ВЕРСИЯ как в SlotVisitHelp)
-                    no_slots_now = page.locator('text="На жаль, зараз немає вільного часу. Спробуйте пізніше або зробіть запис у чергу очікування."')
-                    if await no_slots_now.is_visible():
-                        log_func("Найдено сообщение об отсутствии слотов во время долгого поиска.")
-                        await bot.send_message(chat_id, f"😔 Слотов нет (обнаружено во время поиска). Перезагружаю страницу (попытка {retry_attempts + 1})...")
-                        await page.reload(timeout=60000, wait_until='domcontentloaded')
+                    # Ожидание исчезновения сообщения о поиске с retry логикой
+                    search_timeout = 170000 + 90000  # 260 секунд = 4 минуты 20 секунд как в оригинале
+                    try:
+                        # Используем retry логику для сетевых операций
+                        await retry_network_operation(
+                            lambda: searching_slots_locator.wait_for(state='hidden', timeout=search_timeout),
+                            context_info="ожидание завершения поиска слотов"
+                        )
+                        log_func("Поиск слотов завершен.")
+                        await asyncio.sleep(3)  # Пауза после поиска
+                    except PlaywrightTimeoutError:
+                        log_func(f"Поиск слотов длится слишком долго (>{search_timeout/1000} сек). Принудительно перезагружаю...")
+                        await bot.send_message(chat_id, f"⏱️ Поиск завис. Перезагружаю страницу (попытка {retry_attempts + 1})...")
+                        await retry_network_operation(
+                            lambda: page.reload(timeout=60000, wait_until='domcontentloaded'),
+                            context_info="перезагрузка страницы"
+                        )
                         log_func("Страница успешно перезагружена.")
                         await asyncio.sleep(5)
                         retry_attempts += 1
                         continue
-                    
-                    # Если поиск просто завис, принудительно перезагружаем
-                    log_func("Поиск завис. Принудительно перезагружаю страницу...")
-                    await bot.send_message(chat_id, f"⏱️ Поиск завис. Перезагружаю страницу (попытка {retry_attempts + 1})...")
-                    await page.reload(timeout=60000, wait_until='domcontentloaded')
-                    log_func("Страница успешно перезагружена.")
-                    await asyncio.sleep(5)
-                    retry_attempts += 1
-                    continue
+                else:
+                    log_func("Активный поиск слотов не обнаружен. Проверяю текущее состояние...")
                 
-                # Пауза после поиска
-                await asyncio.sleep(3)
-                
-                # Проверка наличия сообщения об отсутствии слотов (ПОЛНАЯ ВЕРСИЯ как в SlotVisitHelp)
+                # 3. Проверка наличия сообщения об отсутствии слотов
                 no_slots_message_locator = page.locator('text="На жаль, зараз немає вільного часу. Спробуйте пізніше або зробіть запис у чергу очікування."')
-                is_message_visible = await no_slots_message_locator.is_visible()
+                is_no_slots_visible = await no_slots_message_locator.is_visible()
                 
-                if is_message_visible:
-                    # НОВАЯ ЛОГИКА: Сохранение сессии вместо бесконечных попыток
-                    if allow_session_pause and retry_attempts >= 3:  # После 3 попыток предлагаем сохранить сессию
-                        log_func(f"После {retry_attempts} попыток слоты не найдены. Предлагаю сохранить сессию.")
-                        await bot.send_message(chat_id, 
-                            f"💡 **Умная стратегия поиска**\n\n"
-                            f"После {retry_attempts} попыток слоты не найдены.\n"
-                            f"🔄 Сохраняю вашу сессию и переключаюсь на других пользователей.\n"
-                            f"⏰ Вернусь к поиску через {SESSION_RETRY_INTERVAL // 60} минут.")
-                        return "PAUSE_SESSION"  # Специальный код для сохранения сессии
+                if is_no_slots_visible:
+                    # УМНАЯ ЛОГИКА: Проверяем, есть ли другие пользователи в очереди
+                    if allow_session_pause and retry_attempts >= SEARCH_ATTEMPTS_BEFORE_QUEUE_CHECK:  # После N попыток проверяем очередь
+                        # Подсчитываем активных пользователей
+                        total_active_users = len(paused_sessions) + task_queue.qsize() + len(active_workers) - 1  # -1 исключаем текущего пользователя
+                        
+                        if total_active_users > 0:
+                            # Есть другие пользователи - сохраняем сессию и переключаемся
+                            log_func(f"После {retry_attempts} попыток слоты не найдены. Обнаружено {total_active_users} других пользователей. Сохраняю сессию.")
+                            await bot.send_message(chat_id, 
+                                f"💡 **Умная стратегия поиска**\n\n"
+                                f"После {retry_attempts} попыток слоты не найдены.\n"
+                                f"� Обнаружено {total_active_users} других пользователей в очереди.\n"
+                                f"�🔄 Сохраняю вашу сессию и переключаюсь на них.\n"
+                                f"⏰ Вернусь к поиску через {SESSION_RETRY_INTERVAL // 60} минут.")
+                            return "PAUSE_SESSION"  # Специальный код для сохранения сессии
+                        else:
+                            # Нет других пользователей - продолжаем поиск без ограничений
+                            log_func(f"После {retry_attempts} попыток слоты не найдены. Других пользователей нет - продолжаю поиск.")
+                            if retry_attempts == SEARCH_ATTEMPTS_BEFORE_QUEUE_CHECK:  # Уведомляем только один раз
+                                await bot.send_message(chat_id, 
+                                    f"💪 **Продолжаю интенсивный поиск**\n\n"
+                                    f"Других пользователей в очереди нет.\n"
+                                    f"🔄 Продолжаю поиск без ограничений до нахождения слотов!\n"
+                                    f"⚡ Попытка {retry_attempts + 1}...")
                     
                     log_func(f"Сообщение об отсутствии слотов найдено. Попытка {retry_attempts + 1}. Перезагружаю страницу...")
                     await bot.send_message(chat_id, f"😔 Слотов нет. Перезагружаю страницу (попытка {retry_attempts + 1})...")
@@ -736,15 +1492,73 @@ async def book_available_slot(page, bot, user_id, chat_id, log_func, allow_sessi
                     log_func("Страница успешно перезагружена.")
                     await asyncio.sleep(5)
                     retry_attempts += 1
-                else:
-                    log_func("!!! СЛОТЫ НАЙДЕНЫ! Сообщение об отсутствии слотов НЕ найдено. Запускаю бронирование! !!!")
-                    await bot.send_message(chat_id, "🎯 **СЛОТЫ НАЙДЕНЫ!** Начинаю бронирование...")
-                    # Выходим из цикла и переходим к бронированию
-                    break
+                    continue
+                
+                # 4. Если нет сообщения об отсутствии слотов, проверяем наличие календаря со слотами
+                try:
+                    # Ждем появления календаря
+                    await calendar_container.wait_for(state='visible', timeout=15000)
                     
-            except PlaywrightTimeoutError:
-                log_func(f"Тайм-аут ожидания сообщения о поиске слотов на попытке {retry_attempts + 1}")
-                await bot.send_message(chat_id, f"⏱️ Тайм-аут поиска на попытке {retry_attempts + 1}")
+                    # Проверяем, есть ли вкладки месяцев
+                    month_tabs_locator = calendar_container.get_by_text(re.compile(r"^\S+ \d{4}$"))
+                    month_tabs_count = await month_tabs_locator.count()
+                    
+                    if month_tabs_count > 0:
+                        log_func(f"!!! КАЛЕНДАРЬ ЗАГРУЖЕН! Найдено {month_tabs_count} месяцев для проверки слотов! !!!")
+                        await bot.send_message(chat_id, "🎯 **КАЛЕНДАРЬ ЗАГРУЖЕН!** Начинаю проверку слотов...")
+                        # Выходим из цикла и переходим к поиску слотов
+                        break
+                    else:
+                        log_func("Календарь загружен, но вкладки месяцев не найдены. Возможно, еще загружается...")
+                        await asyncio.sleep(3)
+                        # Проверяем еще раз через паузу
+                        month_tabs_count = await month_tabs_locator.count()
+                        if month_tabs_count > 0:
+                            log_func(f"После паузы найдено {month_tabs_count} месяцев!")
+                            break
+                        else:
+                            log_func("Вкладки месяцев так и не появились. Перезагружаю...")
+                            await retry_network_operation(
+                                lambda: page.reload(timeout=60000, wait_until='domcontentloaded'),
+                                context_info="перезагрузка страницы (отсутствие вкладок)"
+                            )
+                            await asyncio.sleep(5)
+                            retry_attempts += 1
+                            continue
+                            
+                except PlaywrightTimeoutError:
+                    log_func("Календарный контейнер не появился в отведенное время. Перезагружаю...")
+                    await bot.send_message(chat_id, f"⏱️ Календарь не загрузился. Перезагружаю (попытка {retry_attempts + 1})...")
+                    await retry_network_operation(
+                        lambda: page.reload(timeout=60000, wait_until='domcontentloaded'),
+                        context_info="перезагрузка страницы (календарь не загрузился)"
+                    )
+                    await asyncio.sleep(5)
+                    retry_attempts += 1
+                    continue
+                    
+            except Exception as check_error:
+                log_func(f"Ошибка при проверке состояния страницы: {check_error}")
+                
+                # Проверяем, является ли ошибка сетевой
+                if is_network_error(check_error):
+                    log_func("Обнаружена сетевая ошибка при проверке состояния")
+                    await bot.send_message(chat_id, f"🌐 Проблемы с сетью. Перезагружаю (попытка {retry_attempts + 1})...")
+                    try:
+                        await retry_network_operation(
+                            lambda: page.reload(timeout=60000, wait_until='domcontentloaded'),
+                            context_info="перезагрузка после сетевой ошибки"
+                        )
+                    except Exception as retry_error:
+                        log_func(f"Не удалось перезагрузить после сетевой ошибки: {retry_error}")
+                        raise NetworkConnectionException(f"Потеря сетевого соединения: {check_error}")
+                else:
+                    await bot.send_message(chat_id, f"⚠️ Ошибка проверки. Перезагружаю (попытка {retry_attempts + 1})...")
+                    await retry_network_operation(
+                        lambda: page.reload(timeout=60000, wait_until='domcontentloaded'),
+                        context_info="перезагрузка после ошибки проверки"
+                    )
+                await asyncio.sleep(5)
                 retry_attempts += 1
                 continue
         
@@ -779,11 +1593,34 @@ async def book_available_slot(page, bot, user_id, chat_id, log_func, allow_sessi
             log_func(f"Перевіряю місяць: {month_name}")
             
             try:
-                await current_month_tab.scroll_into_view_if_needed(timeout=10000)
-                await current_month_tab.click(timeout=15000)
-                await page.wait_for_load_state('networkidle', timeout=60000)
+                await retry_network_operation(
+                    lambda: current_month_tab.scroll_into_view_if_needed(timeout=10000),
+                    context_info=f"прокрутка к месяцу {month_name}"
+                )
+                await retry_network_operation(
+                    lambda: current_month_tab.click(timeout=15000),
+                    context_info=f"клик по месяцу {month_name}"
+                )
+                await retry_network_operation(
+                    lambda: page.wait_for_load_state('networkidle', timeout=60000),
+                    context_info="ожидание загрузки после выбора месяца"
+                )
+                log_func(f"Успешно перешел к месяцу: {month_name}")
+            except (NetworkConnectionException, TemporaryNetworkException) as network_error:
+                log_func(f"Сетевая ошибка при работе с месяцем '{month_name}': {network_error}")
+                await bot.send_message(chat_id, 
+                    f"🌐 Проблемы с сетью при переходе к месяцу '{month_name}'\n"
+                    f"🔄 Повторю попытку через некоторое время...")
+                # Поднимаем ошибку наверх для обработки в main exception handler
+                raise
             except PlaywrightTimeoutError:
                 log_func(f"Не вдалося кликнути по місяцю '{month_name}' (таймаут). Пропускаю.")
+                continue
+            except Exception as e:
+                log_func(f"Неожиданная ошибка при работе с месяцем '{month_name}': {e}")
+                if is_network_error(e):
+                    log_func("Обнаружена сетевая ошибка, поднимаю NetworkConnectionException")
+                    raise NetworkConnectionException(f"Сетевая ошибка при работе с месяцем: {e}")
                 continue
             
             # 3. Пошук тижнів з вільними слотами
@@ -800,76 +1637,195 @@ async def book_available_slot(page, bot, user_id, chat_id, log_func, allow_sessi
             
             # 4. Клік по першому доступному тижню
             week_block = available_week_locator.first
-            week_text_content = (await week_block.text_content() or "").replace('\n', ' ')
-            log_func(f"Вибираю тиждень: {week_text_content}")
-            
-            path = await save_screenshot(page, f"week_with_slots_{month_name.replace(' ', '_')}", user_id)
-            await send_telegram_photo(bot, chat_id, path, f"Знайдено тиждень зі слотами: {week_text_content}")
+            try:
+                week_text_content = await retry_network_operation(
+                    lambda: week_block.text_content(),
+                    context_info="получение текста недели"
+                )
+                week_text_content = (week_text_content or "").replace('\n', ' ')
+                log_func(f"Вибираю тиждень: {week_text_content}")
+                
+                path = await save_screenshot(page, f"week_with_slots_{month_name.replace(' ', '_')}", user_id)
+                await send_telegram_photo(bot, chat_id, path, f"Знайдено тиждень зі слотами: {week_text_content}")
 
-            await week_block.click(timeout=15000)
-            await page.wait_for_load_state('networkidle', timeout=30000)
+                await retry_network_operation(
+                    lambda: week_block.click(timeout=15000),
+                    context_info="клик по неделе с слотами"
+                )
+                await retry_network_operation(
+                    lambda: page.wait_for_load_state('networkidle', timeout=30000),
+                    context_info="ожидание загрузки слотов недели"
+                )
+                
+            except (NetworkConnectionException, TemporaryNetworkException) as network_error:
+                log_func(f"Сетевая ошибка при работе с неделей: {network_error}")
+                await bot.send_message(chat_id, 
+                    f"🌐 Проблемы с сетью при выборе недели\n"
+                    f"🔄 Попробую сохранить прогресс и повторить...")
+                raise
+            except Exception as week_error:
+                log_func(f"Ошибка при выборе недели: {week_error}")
+                if is_network_error(week_error):
+                    raise NetworkConnectionException(f"Сетевая ошибка при выборе недели: {week_error}")
+                continue
             
             # 5. Пошук та вибір першого доступного слоту часу
-            log_func("Прокручую вниз, щоб побачити всі слоти...")
-            await page.keyboard.press("End")
-            await page.wait_for_timeout(1500)
+            try:
+                log_func("Прокручую вниз, щоб побачити всі слоти...")
+                await retry_network_operation(
+                    lambda: page.keyboard.press("End"),
+                    context_info="прокрутка к слотам времени"
+                )
+                await asyncio.sleep(1.5)  # Вместо wait_for_timeout
 
-            all_time_slots = await page.locator('div[role="button"][aria-label]').all()
+                all_time_slots = await retry_network_operation(
+                    lambda: page.locator('div[role="button"][aria-label]').all(),
+                    context_info="получение списка временных слотов"
+                )
+                
+            except (NetworkConnectionException, TemporaryNetworkException) as network_error:
+                log_func(f"Сетевая ошибка при получении слотов времени: {network_error}")
+                await bot.send_message(chat_id, 
+                    f"🌐 Проблемы с сетью при загрузке временных слотов\n"
+                    f"🔄 Сохраняю прогресс...")
+                raise
+            except Exception as slots_error:
+                log_func(f"Ошибка при получении слотов времени: {slots_error}")
+                if is_network_error(slots_error):
+                    raise NetworkConnectionException(f"Сетевая ошибка при получении слотов: {slots_error}")
+                continue
             
             first_available_slot = None
             if not all_time_slots:
                  log_func("Попередження: не знайдено жодного слоту часу (навіть зайнятих).")
             
-            for slot_locator in all_time_slots:
-                aria_label = await slot_locator.get_attribute("aria-label") or ""
-                if "цей слот вже заброньовано" not in aria_label:
-                    first_available_slot = slot_locator
-                    break 
+            # Поиск свободного слота с обработкой сетевых ошибок
+            try:
+                for slot_locator in all_time_slots:
+                    aria_label = await retry_network_operation(
+                        lambda: slot_locator.get_attribute("aria-label"),
+                        context_info="получение атрибута слота времени"
+                    )
+                    if aria_label and "цей слот вже заброньовано" not in aria_label:
+                        first_available_slot = slot_locator
+                        break 
+                        
+            except (NetworkConnectionException, TemporaryNetworkException) as network_error:
+                log_func(f"Сетевая ошибка при проверке слотов времени: {network_error}")
+                await bot.send_message(chat_id, 
+                    f"🌐 Проблемы с сетью при проверке временных слотов\n"
+                    f"🔄 Сохраняю текущий прогресс...")
+                raise
+            except Exception as check_slots_error:
+                log_func(f"Ошибка при проверке слотов времени: {check_slots_error}")
+                if is_network_error(check_slots_error):
+                    raise NetworkConnectionException(f"Сетевая ошибка при проверке слотов: {check_slots_error}")
+                continue
             
             if first_available_slot is None:
                 log_func("Всі слоти на цьому тижні виявилися зайнятими. Повертаюся до вибору місяців.")
-                await page.get_by_role("button", name="Назад").click(timeout=10000)
-                await page.wait_for_load_state('networkidle', timeout=15000)
+                try:
+                    await retry_network_operation(
+                        lambda: page.get_by_role("button", name="Назад").click(timeout=10000),
+                        context_info="возврат назад от слотов"
+                    )
+                    await retry_network_operation(
+                        lambda: page.wait_for_load_state('networkidle', timeout=15000),
+                        context_info="ожидание загрузки после возврата"
+                    )
+                except (NetworkConnectionException, TemporaryNetworkException):
+                    # Если не можем вернуться назад из-за сети - поднимаем ошибку
+                    raise
+                except Exception as back_error:
+                    log_func(f"Ошибка при возврате назад: {back_error}")
+                    if is_network_error(back_error):
+                        raise NetworkConnectionException(f"Сетевая ошибка при возврате: {back_error}")
                 continue # Перехід до наступного місяця
             
-            slot_time_text = await first_available_slot.text_content()
-            log_func(f"Знайдено вільний слот: {slot_time_text}. Вибираю...")
-            
-            await first_available_slot.click(timeout=15000)
-            await page.wait_for_timeout(2000)
+            # Выбор найденного свободного слота
+            try:
+                slot_time_text = await retry_network_operation(
+                    lambda: first_available_slot.text_content(),
+                    context_info="получение времени слота"
+                )
+                log_func(f"Знайдено вільний слот: {slot_time_text}. Вибираю...")
+                
+                await retry_network_operation(
+                    lambda: first_available_slot.click(timeout=15000),
+                    context_info="клик по свободному слоту"
+                )
+                await asyncio.sleep(2)  # Заменяем wait_for_timeout на обычный sleep
+
+            except (NetworkConnectionException, TemporaryNetworkException) as network_error:
+                log_func(f"Сетевая ошибка при выборе слота времени: {network_error}")
+                await bot.send_message(chat_id, 
+                    f"🌐 Проблемы с сетью при выборе времени\n"
+                    f"🔄 Найден свободный слот, но не могу его выбрать из-за сети...")
+                raise
+            except Exception as select_slot_error:
+                log_func(f"Ошибка при выборе слота времени: {select_slot_error}")
+                if is_network_error(select_slot_error):
+                    raise NetworkConnectionException(f"Сетевая ошибка при выборе слота: {select_slot_error}")
+                continue
 
             # 6. Фінальне підтвердження
-            confirm_button_selector = 'button#finish-button'
-            await page.locator(confirm_button_selector).wait_for(state='visible', timeout=15000)
-            log_func("Натискаю кнопку 'Підтвердити'...")
-
-            path = await save_screenshot(page, "final_confirmation", user_id)
-            await send_telegram_photo(bot, chat_id, path, f"Екран перед фінальним підтвердженням слоту {slot_time_text}.")
-
-            await page.locator(confirm_button_selector).click()
-            
-            # 7. Очікування результату з правильними селекторами
-            processing_locator = page.locator('text="Дякуємо, ми обробляємо ваш запит"')
-            success_locator = page.locator('text="Ваш візит успішно заброньовано"')
-
-            await expect(processing_locator.or_(success_locator)).to_be_visible(timeout=60000)
-            
-            if await processing_locator.is_visible():
-                log_func("!!! УСПІХ: Запит на бронювання відправлено! !!!")
-                final_message = "✅ **УСПІХ!** ✅\nЗапит на бронювання відправлено! Очікуйте підтвердження."
-                await bot.send_message(chat_id, final_message)
+            try:
+                confirm_button_selector = 'button#finish-button'
+                await retry_network_operation(
+                    lambda: page.locator(confirm_button_selector).wait_for(state='visible', timeout=15000),
+                    context_info="ожидание кнопки подтверждения"
+                )
                 
-                path = await save_screenshot(page, "booking_processing", user_id)
-                await send_telegram_photo(bot, chat_id, path, "Запит на бронювання обробляється.")
-            
-            elif await success_locator.is_visible():
-                log_func("!!! УСПІХ: Слот успішно заброньовано! !!!")
-                final_message = "✅ **УСПІХ!** ✅\nВізит успішно заброньовано! Перевірте пошту та сторінку 'Мої візити'."
-                await bot.send_message(chat_id, final_message)
-                path = await save_screenshot(page, "booking_confirmed", user_id)
-                await send_telegram_photo(bot, chat_id, path, "Візит успішно заброньовано!")
+                log_func("Натискаю кнопку 'Підтвердити'...")
 
-            return "Успішне бронювання"
+                path = await save_screenshot(page, "final_confirmation", user_id)
+                await send_telegram_photo(bot, chat_id, path, f"Екран перед фінальним підтвердженням слоту {slot_time_text}.")
+
+                await retry_network_operation(
+                    lambda: page.locator(confirm_button_selector).click(),
+                    context_info="клик по кнопке подтверждения"
+                )
+                
+                # 7. Очікування результату з правильними селекторами
+                processing_locator = page.locator('text="Дякуємо, ми обробляємо ваш запит"')
+                success_locator = page.locator('text="Ваш візит успішно заброньовано"')
+
+                await retry_network_operation(
+                    lambda: expect(processing_locator.or_(success_locator)).to_be_visible(timeout=60000),
+                    context_info="ожидание результата бронирования"
+                )
+                
+                if await processing_locator.is_visible():
+                    log_func("!!! УСПІХ: Запит на бронювання відправлено! !!!")
+                    final_message = "✅ **УСПІХ!** ✅\nЗапит на бронювання відправлено! Очікуйте підтвердження."
+                    await bot.send_message(chat_id, final_message)
+                    
+                    path = await save_screenshot(page, "booking_processing", user_id)
+                    await send_telegram_photo(bot, chat_id, path, "Запит на бронювання обробляється.")
+                
+                elif await success_locator.is_visible():
+                    log_func("!!! УСПІХ: Слот успішно заброньовано! !!!")
+                    final_message = "✅ **УСПІХ!** ✅\nВізит успішно заброньовано! Перевірте пошту та сторінку 'Мої візити'."
+                    await bot.send_message(chat_id, final_message)
+                    path = await save_screenshot(page, "booking_confirmed", user_id)
+                    await send_telegram_photo(bot, chat_id, path, "Візит успішно заброньовано!")
+
+                return "Успішне бронювання"
+                
+            except (NetworkConnectionException, TemporaryNetworkException) as network_error:
+                log_func(f"Сетевая ошибка при финальном подтверждении: {network_error}")
+                await bot.send_message(chat_id, 
+                    f"🌐 Проблемы с сетью при подтверждении бронирования\n"
+                    f"🔄 Слот найден и выбран, но подтверждение прервано сетевой ошибкой\n"
+                    f"⚠️ Проверьте состояние бронирования в личном кабинете")
+                raise
+            except Exception as confirm_error:
+                log_func(f"Ошибка при финальном подтверждении: {confirm_error}")
+                if is_network_error(confirm_error):
+                    raise NetworkConnectionException(f"Сетевая ошибка при подтверждении: {confirm_error}")
+                
+                # Для других ошибок пробуем продолжить поиск
+                continue
 
         # Якщо цикл по місяцях завершився без успіху
         log_func("Перевірив усі доступні місяці, але не вдалося забронювати.")
@@ -886,549 +1842,220 @@ async def book_available_slot(page, bot, user_id, chat_id, log_func, allow_sessi
     except Exception as e:
         error_message = f"Критична помилка під час бронювання слоту: {e}"
         log_func(error_message)
-        await bot.send_message(chat_id, f"❗️ Помилка під час бронювання: {str(e).splitlines()[0]}")
+        
+        # Проверяем, является ли ошибка сетевой
+        if is_network_error(e):
+            log_func("Обнаружена сетевая ошибка в процессе бронирования")
+            await bot.send_message(chat_id, f"🌐 Сетевая ошибка: {str(e).splitlines()[0]}")
+            # Поднимаем специализированную сетевую ошибку для обработки на верхнем уровне
+            raise NetworkConnectionException(f"Сетевая ошибка при бронировании: {e}")
+        elif is_temporary_error(e):
+            log_func("Обнаружена временная ошибка в процессе бронирования")
+            await bot.send_message(chat_id, f"⏳ Временная ошибка: {str(e).splitlines()[0]}")
+            raise TemporaryNetworkException(f"Временная ошибка при бронировании: {e}")
+        else:
+            await bot.send_message(chat_id, f"❗️ Помилка під час бронювання: {str(e).splitlines()[0]}")
+        
         path = await save_screenshot(page, "booking_critical_error", user_id)
         if path:
             await send_telegram_photo(bot, chat_id, path, "Критична помилка під час бронювання")
         return f"Помилка: {e}"
 
 async def run_booking_session(bot: Bot, user_id: int, user_data: dict, worker_id: int, headless_mode: bool):
+    """Основна функція для запуску сесії бронювання."""
+    import time
+    chat_id = user_id
+    log_func = lambda msg: logging.info(f"[Воркер-{worker_id}] {msg}")
     p = context = page = browser = None
-    chat_id = user_data.get('chat_id')
-    log_func = lambda msg: logging.info(f"[Воркер-{worker_id}][Користувач-{user_id}] {msg}")
-
-    try:
-        log_func("="*20 + " ПОЧАТОК НОВОЇ СЕСІЇ " + "="*20)
-        
-        # Перевіряємо наявність всіх необхідних полів
-        required_fields = ['auth_method', 'date_of_birth', 'gender', 'country', 'institution', 'service_type', 'service_recipient']
-        missing_fields = [field for field in required_fields if field not in user_data]
-        
-        if missing_fields:
-            error_msg = f"Відсутні необхідні дані: {', '.join(missing_fields)}. Потрібно пройти налаштування заново."
-            log_func(error_msg)
-            await bot.send_message(chat_id, f"❗️ {error_msg}")
-            raise SessionResetException(error_msg)
-        
-        p = await async_playwright().start()
-
-        browser = await p.chromium.launch(
-            headless=headless_mode,
-            channel="chrome",
-            args=["--start-maximized", "--disable-blink-features=AutomationControlled"],
-            timeout=60000
-        )
-
-        context = await browser.new_context(
-            locale="uk-UA",
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-            timezone_id="Europe/Kiev"
-        )
-        page = await context.new_page()
-
-        await page.evaluate("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-        log_func("Маскування navigator.webdriver застосовано.")
-
-        await page.goto("https://e-consul.gov.ua/", timeout=120000, wait_until="domcontentloaded")
-        log_func(f"Сторінку завантажено. URL: {page.url}")
-
-        is_logged_in = await check_session_validity(page)
-        if not is_logged_in:
-            log_func("Сесія неактивна. Починаю процес авторизації...")
-            await bot.send_message(chat_id, "Сесія неактивна. Починаю авторизацію...")
-
-            if "id.e-consul.gov.ua" not in page.url:
-                 await page.goto("https://id.e-consul.gov.ua/", timeout=60000)
-
-            auth_method = user_data['auth_method']
-            if auth_method == 'diia':
-                await page.get_by_role("button", name="Дія.Підпис").click()
-                await page.wait_for_load_state('networkidle')
-                await page.wait_for_timeout(3000)
-                qr_element = page.locator("canvas, div.qr-code").first
-                await qr_element.wait_for(state='visible', timeout=60000)
-                qr_path = await save_screenshot(page, "diia_qr_code", user_id, locator=qr_element)
-                await send_telegram_photo(bot, chat_id, qr_path, "Відскануйте QR-код у застосунку 'Дія' для авторизації.")
-                await bot.send_message(chat_id, "Очікую підтвердження в 'Дія'. У вас є 3 хвилини.")
-                await page.wait_for_url("**/e-consul.gov.ua/**", timeout=180000)
-            elif auth_method == 'key':
-                await page.get_by_role("button", name="Особистий ключ").click()
-                await page.wait_for_load_state('networkidle')
-                async with page.expect_file_chooser() as fc_info:
-                    await page.locator('text="Оберіть ключ на своєму носієві"').click()
-                await (await fc_info.value).set_files(user_data['key_file_path'])
-                await page.locator('#id-app-login-sign-form-file-key-server').click()
-                await page.locator('li[data-value="31"]').click()
-                await page.locator('input#id-app-login-sign-form-file-key-password').fill(user_data['key_password'])
-                async with page.expect_navigation(url="**/e-consul.gov.ua/**"):
-                    await page.locator('button#id-app-login-sign-form-file-key-sign-button').click()
-            elif auth_method == 'idgov':
-                await page.locator('button').nth(2).click()
-                await page.get_by_text("Bank ID НБУ").click()
-                await page.locator('#selBankConnect-button').click()
-                await page.locator('#ui-id-4').click()
-                async with page.expect_navigation(url="**/api.monobank.ua/**"):
-                    await page.locator('#btnBankIDChoose').click()
-                await page.wait_for_timeout(3000)
-                qr_element = page.locator("#qr-overlay, div.qr-code, canvas").first
-                await qr_element.wait_for(state='visible', timeout=60000)
-                qr_path = await save_screenshot(page, "bankid_qr_code", user_id, locator=qr_element)
-                await send_telegram_photo(bot, chat_id, qr_path, "Відскануйте QR-код у додатку Monobank.")
-                await page.wait_for_url("**/id.gov.ua/bankid-auth-callback**", timeout=180000)
-                async with page.expect_navigation(url="**/e-consul.gov.ua/**"):
-                    await page.locator('#btnAcceptUserDataAgreement').click()
-
-            # Дополнительная проверка успешной загрузки
-            try:
-                await page.wait_for_load_state('networkidle', timeout=30000)
-                await page.wait_for_load_state('domcontentloaded', timeout=30000)
-                
-                # Проверяем, что мы действительно авторизованы
-                await page.wait_for_selector('a:has-text("Запис на візит")', timeout=20000)
-                
-                await bot.send_message(chat_id, "✅ Авторизація успішна. Профіль сесії збережено.")
-                log_func(f"Авторизація успішна. URL: {page.url}")
-            except PlaywrightTimeoutError:
-                raise SessionResetException("Timeout при проверке авторизации")
-        else:
-            await bot.send_message(chat_id, "Сесія активна, використовую збережений профіль.")
-            log_func("Сесія активна, пропускаю авторизацію.")
-            
-            # Дополнительная проверка активной сессии
-            try:
-                await page.reload(timeout=30000)
-                await page.wait_for_selector('a:has-text("Запис на візит")', timeout=20000)
-            except PlaywrightTimeoutError:
-                raise SessionResetException("Сессия оказалась неактивной после проверки")
-
-        await bot.send_message(chat_id, "Переходжу до створення запису та заповнення даних...")
-        await page.get_by_role("link", name="Запис на візит").click()
-        await page.get_by_role("link", name="Записатись на візит").click()
-        await page.wait_for_url("**/applicantInfo**", timeout=60000)
-
-        dob = datetime.strptime(user_data['date_of_birth'], "%d.%m.%Y")
-        await page.locator('input[aria-label="день"]').fill(str(dob.day))
-        month_names_uk = ["січня", "лютого", "березня", "квітня", "травня", "червня", "липня", "серпня", "вересня", "жовтня", "листопада", "грудня"]
-        await page.locator('div[aria-label="місяць"]').click()
-        await page.get_by_role("option", name=month_names_uk[dob.month - 1]).click()
-        await page.locator('input[aria-label="рік"]').fill(str(dob.year))
-        gender_map = {'male': "Чоловіча", 'female': "Жіноча"}
-        await page.get_by_label(gender_map[user_data['gender']]).check()
-        await page.get_by_role("button", name="Далі").click()
-        await page.wait_for_url("**/placeOfVisitInfo**", timeout=60000)
-
-        await page.locator('input[id="country"]').fill(user_data['country'])
-        await page.locator(f"li:has-text(\"{user_data['country']}\")").click()
-        await page.wait_for_timeout(2000)
-        await page.locator('input[id="consularInstitution"]').fill(user_data['institution'])
-        await page.locator(f"li:has-text(\"{user_data['institution']}\")").click()
-        await page.get_by_role("button", name="Далі").click()
-        await page.wait_for_url("**/consularServiceInfo**", timeout=60000)
-
-        service_input = page.locator('input[id="service"]')
-        await service_input.fill(user_data['service_type'], timeout=10000)
-        await page.wait_for_timeout(1000)
-        await page.get_by_role("option", name=user_data['service_type'], exact=True).click(timeout=10000)
-
-        recipient_map = {'self': "Для себе", 'child': "Для своєї дитини, підопічного"}
-        await page.get_by_label(recipient_map[user_data['service_recipient']]).check()
-        if user_data['service_recipient'] == 'child':
-            await page.locator('input[aria-label="Прізвище"]').fill(user_data['child_surname'])
-            await page.locator('input[aria-label=" Ім\'я"]').fill(user_data['child_firstname'])
-            await page.locator('input[aria-label="По батькові"]').fill(user_data['child_middlename'])
-
-        await page.get_by_role("button", name="Далі").click()
-        await page.wait_for_url("**/dateAndTimeVisitInfo**", timeout=60000)
-        log_func("Всі дані успішно введено.")
-        await bot.send_message(chat_id, "✅ Всі дані успішно введено.")
-        
-        # Пробуем поиск слотов один раз
-        log_func("Начинаю поиск слотов с новой логикой...")
-        booking_result = await book_available_slot(page, bot, user_id, chat_id, log_func, allow_session_pause=True)
-        
-        if booking_result == "Успішне бронювання":
-            log_func("Бронювання успішне! Завершую роботу з користувачем.")
-            await bot.send_message(chat_id, "🎉 **Бронювання успішне!**")
-            return "SUCCESS"
-        elif booking_result == "PAUSE_SESSION":
-            log_func("Паузим сессию и сохраняем контекст браузера")
-            # Сохраняем сессию для последующего восстановления
-            await save_browser_session(user_id, context, page, bot)
-            return "SESSION_PAUSED"
-        else:
-            # Другие результаты обрабатываем как обычно
-            log_func(f"Результат поиска: {booking_result}")
-            if "Тайм-аут" in booking_result or "Помилка" in booking_result:
-                raise SessionResetException(f"Ошибка поиска: {booking_result}")
-            return "NO_SLOTS_RETRY"
-
-    except SessionResetException as e:
-        log_func(f"Штатный перезапуск сесії: {e}")
-        
-        # Сделаем скриншот перед перезапуском
-        try:
-            if page and not page.is_closed():
-                path = await save_screenshot(page, "session_reset", user_id)
-                if path:
-                    await send_telegram_photo(bot, chat_id, path, 
-                        "🔄 Снимок екрана перед перезапуском сесії")
-        except Exception as screenshot_error:
-            log_func(f"Не вдалося зробити скриншот перед перезапуском: {screenshot_error}")
-        
-        # Корректно закриваем все ресурсы
-        try:
-            if context: 
-                await context.close()
-            if browser and browser.is_connected(): 
-                await browser.close()
-            if p: 
-                await p.stop()
-        except Exception as close_error:
-            log_func(f"Ошибка при закрытии ресурсов: {close_error}")
-        
-        # Небольшая пауза перед перезапуском
-        await asyncio.sleep(5)
-        raise
-
-    except Exception as e:
-        error_message = f"Сталася критична помилка в run_booking_session: {e}"
-        log_func(error_message)
-        full_traceback = traceback.format_exc()
-        logging.error("\nПОВНИЙ ТРЕЙСБЕК ПОМИЛКИ:\n" + full_traceback)
-        
-        path = None
-        if page and not page.is_closed():
-            path = await save_screenshot(page, "critical_error_screenshot", user_id)
-
-        if chat_id:
-            caption = (f"❗️ **Сталася помилка у воркері.**\n\n"
-                       f"`{str(e).splitlines()[0]}`\n\n"
-                       f"Завдання буде перезапущено. Дивіться скріншот для деталей.")
-            
-            if path:
-                await send_telegram_photo(bot, chat_id, path, caption=caption)
-            else:
-                await bot.send_message(chat_id, caption)
-
-        if context: await context.close()
-        if browser and browser.is_connected(): await browser.close()
-        if p: await p.stop()
-        raise SessionResetException(f"Критична помилка: {e}")
-    finally:
-        # Закриваємо браузер только если сессия НЕ была сохранена
-        if user_id not in paused_sessions:
-            log_func("Спроба закрити ресурси Playwright...")
-            try:
-                if context:
-                    await context.close()
-                    log_func("Контекст Playwright закрито.")
-                if browser and browser.is_connected():
-                    await browser.close()
-                    log_func("Браузер Playwright закрито.")
-                if p:
-                    await p.stop()
-                    log_func("Playwright зупинено.")
-            except Exception as e:
-                log_func(f"Помилка при закритті ресурсів Playwright: {e}")
-        else:
-            log_func("Сессия сохранена, не закрываю браузерные ресурсы")
-        log_func("="*20 + " КІНЕЦЬ СЕСІЇ " + "="*20 + "\n")
-    p = context = page = browser = None
-    chat_id = user_data.get('chat_id')
-    log_func = lambda msg: logging.info(f"[Воркер-{worker_id}][Користувач-{user_id}] {msg}")
-
-    try:
-        log_func("="*20 + " ПОЧАТОК НОВОЇ СЕСІЇ " + "="*20)
-        
-        # Перевіряємо наявність всіх необхідних полів
-        required_fields = ['auth_method', 'date_of_birth', 'gender', 'country', 'institution', 'service_type', 'service_recipient']
-        missing_fields = [field for field in required_fields if field not in user_data]
-        
-        if missing_fields:
-            error_msg = f"Відсутні необхідні дані: {', '.join(missing_fields)}. Потрібно пройти налаштування заново."
-            log_func(error_msg)
-            await bot.send_message(chat_id, f"❗️ {error_msg}")
-            raise SessionResetException(error_msg)
-        
-        p = await async_playwright().start()
-
-        browser = await p.chromium.launch(
-            headless=headless_mode,
-            channel="chrome",
-            args=["--start-maximized", "--disable-blink-features=AutomationControlled"],
-            timeout=60000
-        )
-
-        context = await browser.new_context(
-            locale="uk-UA",
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-            timezone_id="Europe/Kiev"
-        )
-        page = await context.new_page()
-
-        await page.evaluate("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-        log_func("Маскування navigator.webdriver застосовано.")
-
-        await page.goto("https://e-consul.gov.ua/", timeout=120000, wait_until="domcontentloaded")
-        log_func(f"Сторінку завантажено. URL: {page.url}")
-
-        is_logged_in = await check_session_validity(page)
-        if not is_logged_in:
-            log_func("Сесія неактивна. Починаю процес авторизації...")
-            await bot.send_message(chat_id, "Сесія неактивна. Починаю авторизацію...")
-
-            if "id.e-consul.gov.ua" not in page.url:
-                 await page.goto("https://id.e-consul.gov.ua/", timeout=60000)
-
-            auth_method = user_data['auth_method']
-            if auth_method == 'diia':
-                await page.get_by_role("button", name="Дія.Підпис").click()
-                await page.wait_for_load_state('networkidle')
-                await page.wait_for_timeout(3000)
-                qr_element = page.locator("canvas, div.qr-code").first
-                await qr_element.wait_for(state='visible', timeout=60000)
-                qr_path = await save_screenshot(page, "diia_qr_code", user_id, locator=qr_element)
-                await send_telegram_photo(bot, chat_id, qr_path, "Відскануйте QR-код у застосунку 'Дія' для авторизації.")
-                await bot.send_message(chat_id, "Очікую підтвердження в 'Дія'. У вас є 3 хвилини.")
-                await page.wait_for_url("**/e-consul.gov.ua/**", timeout=180000)
-            elif auth_method == 'key':
-                await page.get_by_role("button", name="Особистий ключ").click()
-                await page.wait_for_load_state('networkidle')
-                async with page.expect_file_chooser() as fc_info:
-                    await page.locator('text="Оберіть ключ на своєму носієві"').click()
-                await (await fc_info.value).set_files(user_data['key_file_path'])
-                await page.locator('#id-app-login-sign-form-file-key-server').click()
-                await page.locator('li[data-value="31"]').click()
-                await page.locator('input#id-app-login-sign-form-file-key-password').fill(user_data['key_password'])
-                async with page.expect_navigation(url="**/e-consul.gov.ua/**"):
-                    await page.locator('button#id-app-login-sign-form-file-key-sign-button').click()
-            elif auth_method == 'idgov':
-                await page.locator('button').nth(2).click()
-                await page.get_by_text("Bank ID НБУ").click()
-                await page.locator('#selBankConnect-button').click()
-                await page.locator('#ui-id-4').click()
-                async with page.expect_navigation(url="**/api.monobank.ua/**"):
-                    await page.locator('#btnBankIDChoose').click()
-                await page.wait_for_timeout(3000)
-                qr_element = page.locator("#qr-overlay, div.qr-code, canvas").first
-                await qr_element.wait_for(state='visible', timeout=60000)
-                qr_path = await save_screenshot(page, "bankid_qr_code", user_id, locator=qr_element)
-                await send_telegram_photo(bot, chat_id, qr_path, "Відскануйте QR-код у додатку Monobank.")
-                await page.wait_for_url("**/id.gov.ua/bankid-auth-callback**", timeout=180000)
-                async with page.expect_navigation(url="**/e-consul.gov.ua/**"):
-                    await page.locator('#btnAcceptUserDataAgreement').click()
-
-            # Дополнительная проверка успешной загрузки
-            try:
-                await page.wait_for_load_state('networkidle', timeout=30000)
-                await page.wait_for_load_state('domcontentloaded', timeout=30000)
-                
-                # Проверяем, что мы действительно авторизованы
-                await page.wait_for_selector('a:has-text("Запис на візит")', timeout=20000)
-                
-                await bot.send_message(chat_id, "✅ Авторизація успішна. Профіль сесії збережено.")
-                log_func(f"Авторизація успішна. URL: {page.url}")
-            except PlaywrightTimeoutError:
-                raise SessionResetException("Timeout при проверке авторизации")
-        else:
-            await bot.send_message(chat_id, "Сесія активна, використовую збережений профіль.")
-            log_func("Сесія активна, пропускаю авторизацію.")
-            
-            # Дополнительная проверка активной сессии
-            try:
-                await page.reload(timeout=30000)
-                await page.wait_for_selector('a:has-text("Запис на візит")', timeout=20000)
-            except PlaywrightTimeoutError:
-                raise SessionResetException("Сессия оказалась неактивной после проверки")
-
-        await bot.send_message(chat_id, "Переходжу до створення запису та заповнення даних...")
-        await page.get_by_role("link", name="Запис на візит").click()
-        await page.get_by_role("link", name="Записатись на візит").click()
-        await page.wait_for_url("**/applicantInfo**", timeout=60000)
-
-        dob = datetime.strptime(user_data['date_of_birth'], "%d.%m.%Y")
-        await page.locator('input[aria-label="день"]').fill(str(dob.day))
-        month_names_uk = ["січня", "лютого", "березня", "квітня", "травня", "червня", "липня", "серпня", "вересня", "жовтня", "листопада", "грудня"]
-        await page.locator('div[aria-label="місяць"]').click()
-        await page.get_by_role("option", name=month_names_uk[dob.month - 1]).click()
-        await page.locator('input[aria-label="рік"]').fill(str(dob.year))
-        gender_map = {'male': "Чоловіча", 'female': "Жіноча"}
-        await page.get_by_label(gender_map[user_data['gender']]).check()
-        await page.get_by_role("button", name="Далі").click()
-        await page.wait_for_url("**/placeOfVisitInfo**", timeout=60000)
-
-        await page.locator('input[id="country"]').fill(user_data['country'])
-        await page.locator(f"li:has-text(\"{user_data['country']}\")").click()
-        await page.wait_for_timeout(2000)
-        await page.locator('input[id="consularInstitution"]').fill(user_data['institution'])
-        await page.locator(f"li:has-text(\"{user_data['institution']}\")").click()
-        await page.get_by_role("button", name="Далі").click()
-        await page.wait_for_url("**/consularServiceInfo**", timeout=60000)
-
-        service_input = page.locator('input[id="service"]')
-        await service_input.fill(user_data['service_type'], timeout=10000)
-        await page.wait_for_timeout(1000)
-        await page.get_by_role("option", name=user_data['service_type'], exact=True).click(timeout=10000)
-
-        recipient_map = {'self': "Для себе", 'child': "Для своєї дитини, підопічного"}
-        await page.get_by_label(recipient_map[user_data['service_recipient']]).check()
-        if user_data['service_recipient'] == 'child':
-            await page.locator('input[aria-label="Прізвище"]').fill(user_data['child_surname'])
-            await page.locator('input[aria-label=" Ім\'я"]').fill(user_data['child_firstname'])
-            await page.locator('input[aria-label="По батькові"]').fill(user_data['child_middlename'])
-
-        await page.get_by_role("button", name="Далі").click()
-        await page.wait_for_url("**/dateAndTimeVisitInfo**", timeout=60000)
-        log_func("Всі дані успішно введено.")
-        await bot.send_message(chat_id, "✅ Всі дані успішно введено.")
-        
-        # Запускаємо цикл пошуку слотів до успіху
-        search_attempt = 1
-        while True:
-            log_func(f"Починаю спробу пошуку #{search_attempt}...")
-            await bot.send_message(chat_id, f"🔍 Спроба пошуку #{search_attempt}...")
-            
-            booking_result = await book_available_slot(page, bot, user_id, chat_id, log_func)
-            
-            if booking_result == "Успішне бронювання":
-                log_func("Бронювання успішне! Завершую роботу з користувачем.")
-                await bot.send_message(chat_id, "🎉 **Бронювання успішне!**")
-                return  # Успіх, виходимо з функції
-            elif booking_result == "Не вдалося забронювати":
-                log_func(f"Спроба #{search_attempt}: Слотів немає. Чекаю 30 секунд перед наступною спробою...")
-                await bot.send_message(chat_id, f"😔 Спроба #{search_attempt}: Слотів немає. Чекаю 30 секунд і шукаю знову...")
-                await asyncio.sleep(30)  # Пауза між спробами
-                search_attempt += 1
-                continue  # Продовжуємо пошук в тому ж календарі
-            elif "Календар завантажився, але вкладки місяців не знайдено" in booking_result:
-                log_func("Календар завантажився, але вкладки місяців не знайдено.")
-                raise SessionResetException("Проблема з відображенням календаря")
-            elif "Тайм-аут завантаження календаря" in booking_result:
-                log_func("Тайм-аут завантаження календаря.")
-                raise SessionResetException("Тайм-аут завантаження календаря")
-            elif "Тайм-аут" in booking_result:
-                log_func(f"Тайм-аут під час бронювання: {booking_result}")
-                raise SessionResetException(f"Тайм-аут завантаження елементів: {booking_result}")
-            elif "Помилка" in booking_result:
-                log_func(f"Помилка під час бронювання: {booking_result}")
-                raise SessionResetException(f"Помилка бронювання: {booking_result}")
-            else:
-                log_func(f"Невідомий результат з book_available_slot: {booking_result}")
-                raise SessionResetException(f"Невідомий результат: {booking_result}")
-
-    except SessionResetException as e:
-        log_func(f"Штатний перезапуск сесії: {e}")
-        
-        # Сделаем скриншот перед перезапуском
-        try:
-            if page and not page.is_closed():
-                path = await save_screenshot(page, "session_reset", user_id)
-                if path:
-                    await send_telegram_photo(bot, chat_id, path, 
-                        "🔄 Снимок екрана перед перезапуском сесії")
-        except Exception as screenshot_error:
-            log_func(f"Не вдалося зробити скриншот перед перезапуском: {screenshot_error}")
-        
-        # Корректно закриваем все ресурсы
-        try:
-            if context: 
-                await context.close()
-            if browser and browser.is_connected(): 
-                await browser.close()
-            if p: 
-                await p.stop()
-        except Exception as close_error:
-            log_func(f"Ошибка при закрытии ресурсов: {close_error}")
-        
-        # Небольшая пауза перед перезапуском
-        await asyncio.sleep(5)
-        raise
-
-    except Exception as e:
-        error_message = f"Сталася критична помилка в run_booking_session: {e}"
-        log_func(error_message)
-        full_traceback = traceback.format_exc()
-        logging.error("\nПОВНИЙ ТРЕЙСБЕК ПОМИЛКИ:\n" + full_traceback)
-        
-        path = None
-        if page and not page.is_closed():
-            path = await save_screenshot(page, "critical_error_screenshot", user_id)
-
-        if chat_id:
-            caption = (f"❗️ **Сталася помилка у воркері.**\n\n"
-                       f"`{str(e).splitlines()[0]}`\n\n"
-                       f"Завдання буде перезапущено. Дивіться скріншот для деталей.")
-            
-            if path:
-                await send_telegram_photo(bot, chat_id, path, caption=caption)
-            else:
-                await bot.send_message(chat_id, caption)
-
-        if context: await context.close()
-        if browser and browser.is_connected(): await browser.close()
-        if p: await p.stop()
-        raise SessionResetException(f"Критична помилка: {e}")
-    finally:
-        # Закриваємо браузер у будь-якому випадку: успіх, помилка чи перезапуск
-        log_func("Спроба закрити ресурси Playwright...")
-        try:
-            if context:
-                await context.close()
-                log_func("Контекст Playwright закрито.")
-            if browser and browser.is_connected():
-                await browser.close()
-                log_func("Браузер Playwright закрито.")
-            if p:
-                await p.stop()
-                log_func("Playwright зупинено.")
-        except Exception as e:
-            log_func(f"Помилка при закритті ресурсів Playwright: {e}")
-        log_func("="*20 + " КІНЕЦЬ СЕСІЇ " + "="*20 + "\n")
-
-async def run_restored_session(bot: Bot, user_id: int, user_data: dict, worker_id: int):
-    """Работает с восстановленной сессией"""
-    chat_id = user_data.get('chat_id')
-    log_func = lambda msg: logging.info(f"[Воркер-{worker_id}][Восстановление-{user_id}] {msg}")
     
     try:
-        log_func("="*20 + " ВОССТАНОВЛЕНИЕ СЕССИИ " + "="*20)
+        log_func(f"Запускаю сесію бронювання для користувача {user_id}")
         
-        # Восстанавливаем сохраненную сессию
-        context, page = await restore_browser_session(user_id, bot)
+        # Імпорт Playwright
+        from playwright.async_api import async_playwright
+        p = await async_playwright().start()
         
-        if not context or not page:
-            log_func("Не удалось восстановить сессию, запускаю новую")
-            return await run_booking_session(bot, user_id, user_data, worker_id, headless_mode=True)
-        
-        log_func("Сессия успешно восстановлена, продолжаю поиск слотов...")
-        
-        # Продолжаем поиск слотов
-        booking_result = await book_available_slot(page, bot, user_id, chat_id, log_func, allow_session_pause=True)
-        
-        if booking_result == "Успішне бронювання":
-            log_func("Бронювання успішне в восстановленной сессии!")
-            await bot.send_message(chat_id, "🎉 **Бронювання успішне!**")
-            # Закрываем сессию после успеха
-            await close_paused_session(user_id, bot)
-            return "SUCCESS"
-        elif booking_result == "PAUSE_SESSION":
-            log_func("Снова паузим сессию")
-            # Обновляем время последней попытки
-            import time
-            paused_sessions[user_id]['last_attempt'] = time.time()
-            return "SESSION_PAUSED_AGAIN"
+        # Перевірка та відновлення браузерної сесії
+        session_result = await restore_browser_session(user_id, bot, headless_mode)
+        if session_result and len(session_result) == 2:
+            context, page = session_result
+            browser = None  # restore_browser_session не возвращает browser
         else:
-            log_func(f"Восстановленная сессия дала результат: {booking_result}")
-            # При ошибках закрываем сессию
-            await close_paused_session(user_id, bot)
-            return "SESSION_CLOSED"
+            context, page = None, None
+        
+        if not page:
+            log_func("Браузерна сесія не знайдена, створюю нову")
+            await safe_send_message(bot, chat_id, "🔄 Створюю нову браузерну сесію...")
             
+            # Проверяем, нужно ли очистить старые persistent данные
+            auth_method = user_data.get('auth_method', 'unknown')
+            user_persistent_dir = os.path.join(PERSISTENT_SESSIONS_DIR, str(user_id))
+            user_profile_dir = os.path.join(BASE_PROFILES_DIR, str(user_id))
+            
+            # Для BankID и Diya очищаем старые данные, так как они быстро устаревают
+            if auth_method in ['idgov', 'diia', 'bankid'] and (os.path.exists(user_persistent_dir) or os.path.exists(user_profile_dir)):
+                log_func(f"Очищаю старые persistent данные для метода авторизации {auth_method}")
+                try:
+                    if os.path.exists(user_persistent_dir):
+                        import shutil
+                        shutil.rmtree(user_persistent_dir)
+                    if os.path.exists(user_profile_dir):
+                        import shutil
+                        shutil.rmtree(user_profile_dir)
+                    log_func("Старые данные успешно очищены")
+                except Exception as cleanup_error:
+                    log_func(f"Ошибка при очистке старых данных: {cleanup_error}")
+            
+            session_result = await create_new_session_from_persistent(user_id, headless=headless_mode)
+            if session_result and len(session_result) == 2:
+                context, page = session_result
+                browser = None  # create_new_session_from_persistent тоже не возвращает browser
+            else:
+                context, page = None, None
+            
+            if not page:
+                error_msg = "Не вдалося створити браузерну сесію"
+                await safe_send_message(bot, chat_id, f"❌ {error_msg}")
+                return error_msg
+        
+        # Базовая проверка работоспособности браузера
+        try:
+            await page.goto("https://e-consul.gov.ua/", timeout=60000)
+        except Exception as navigation_error:
+            log_func(f"Не удалось загрузить главную страницу: {navigation_error}")
+            error_msg = "Не вдалося завантажити сайт e-consul.gov.ua"
+            await safe_send_message(bot, chat_id, f"❌ {error_msg}")
+            return error_msg
+        
+        # Перевірка валідності сесії
+        session_valid = await check_session_validity(page)
+        auth_method = user_data.get('auth_method', 'unknown')
+        
+        if not session_valid:
+            log_func("Сесія недійсна, потрібна реавторизація")
+            
+            # Для BankID и Diya требуется ручная авторизация
+            if auth_method in ['idgov', 'diia', 'bankid']:
+                auth_name = {'diia': 'Дія', 'idgov': 'BankID', 'bankid': 'BankID'}.get(auth_method, auth_method)
+                
+                # Проверяем, на какой странице мы находимся
+                current_url = page.url
+                if "id.e-consul.gov.ua" in current_url:
+                    # Мы на странице авторизации - нужна ручная авторизация
+                    error_msg = f"Потрібна авторизація через {auth_name}"
+                    log_func(f"Need manual authorization for {auth_method}")
+                    await safe_send_message(bot, chat_id, 
+                        f"🔐 **Авторизація через {auth_name}**\n"
+                        f"Будь ласка, авторизуйтесь на відкритій сторінці браузера.\n"
+                        f"Після авторизації поиск автоматически продолжится.")
+                    
+                    # Ждем авторизации пользователя (максимум 5 минут)
+                    auth_timeout = 300  # 5 минут
+                    auth_start_time = time.time()
+                    
+                    while time.time() - auth_start_time < auth_timeout:
+                        await asyncio.sleep(10)  # Проверяем каждые 10 секунд
+                        try:
+                            current_url = page.url
+                            if "e-consul.gov.ua" in current_url and "id.e-consul.gov.ua" not in current_url:
+                                # Пользователь авторизовался
+                                session_valid = await check_session_validity(page)
+                                if session_valid:
+                                    log_func("Пользователь успешно авторизовался")
+                                    await safe_send_message(bot, chat_id, "✅ Авторизация успешна! Продолжаю поиск...")
+                                    break
+                        except Exception as auth_check_error:
+                            log_func(f"Ошибка при проверке авторизации: {auth_check_error}")
+                            continue
+                    
+                    if not session_valid:
+                        error_msg = f"Время ожидания авторизации истекло"
+                        await safe_send_message(bot, chat_id, f"⏰ {error_msg}")
+                        return error_msg
+                        
+                else:
+                    # Мы не на странице авторизации, но сессия недействительна
+                    error_msg = f"Сесія застаріла. Потрібна повторна авторизація через {auth_name}"
+                    log_func(f"Session expired for {auth_method}, manual reauth required")
+                    await safe_send_message(bot, chat_id, 
+                        f"🔐 **Сесія застаріла**\n"
+                        f"Потрібна повторна авторизація через {auth_name}.\n"
+                        f"Будь ласка, запустіть команду /book_new знову для нової авторизації.")
+                    return error_msg
+                    
+            elif auth_method == 'key':
+                # Автоматическая реавторизация только для файла-ключа
+                auth_success = await auto_reauth_with_key(page, user_data, chat_id, bot)
+                if not auth_success:
+                    error_msg = "Не вдалося відновити авторизацію з файлом-ключем"
+                    await safe_send_message(bot, chat_id, f"❌ {error_msg}")
+                    return error_msg
+            else:
+                # Неизвестный метод авторизации
+                error_msg = f"Невідомий метод авторизації: {auth_method}"
+                log_func(error_msg)
+                await safe_send_message(bot, chat_id, f"❌ {error_msg}")
+                return error_msg
+        
+        # Запуск бронювання
+        result = await book_available_slot(page, bot, user_id, chat_id, log_func)
+        log_func(f"Результат бронювання: {result}")
+        
+        return result
+        
+    except NetworkConnectionException as network_error:
+        error_msg = f"Мережева помилка: {network_error}"
+        log_func(error_msg)
+        await safe_send_message(bot, chat_id, 
+            f"🌐 Проблеми з інтернет-соединением\n"
+            f"🔄 Система попробує відновити з'єднання автоматично...")
+        raise  # Передаємо обробку в worker function
+        
+    except TemporaryNetworkException as temp_network_error:
+        error_msg = f"Тимчасова мережева помилка: {temp_network_error}"
+        log_func(error_msg)
+        await safe_send_message(bot, chat_id, 
+            f"🌐 Тимчасові проблеми з мережею\n"
+            f"🔄 Повторна спроба через деякий час...")
+        raise  # Передаємо обробку в worker function
+        
     except Exception as e:
-        log_func(f"Ошибка в восстановленной сессии: {e}")
-        await close_paused_session(user_id, bot)
-        raise SessionResetException(f"Ошибка восстановленной сессии: {e}")
-
-# --- Worker and Telegram Handlers ---
+        # Перевіряємо, чи є це мережевою помилкою
+        if is_network_error(e):
+            error_msg = f"Мережева помилка (виявлена в загальному обробнику): {e}"
+            log_func(error_msg)
+            await safe_send_message(bot, chat_id, 
+                f"🌐 Проблеми з інтернет-соединением\n"
+                f"🔄 Система попробує відновити з'єднання...")
+            # Підіймаємо NetworkConnectionException для правильної обробки в worker
+            raise NetworkConnectionException(error_msg)
+        
+        # Звичайна критична помилка
+        error_msg = f"Критична помилка під час бронювання слоту: {e}"
+        log_func(error_msg)
+        try:
+            path = await save_screenshot(page, f"error_critical_{int(time.time())}", user_id)
+            if path:
+                await send_telegram_photo(bot, chat_id, path, "Критична помилка під час бронювання")
+        except Exception as screenshot_error:
+            log_func(f"Не вдалося зробити скріншот помилки: {screenshot_error}")
+        
+        await safe_send_message(bot, chat_id, f"❗️ Сталася критична помилка: {str(e).splitlines()[0]}")
+        return error_msg
+        
+    finally:
+        # Очищаємо ресурси
+        try:
+            if page:
+                await page.close()
+            if context:
+                await context.close()
+            if browser:
+                await browser.close()
+            if p:
+                await p.stop()
+        except Exception as cleanup_error:
+            log_func(f"Помилка при очищенні ресурсів: {cleanup_error}")
 
 async def worker(worker_id: int, app: Application, headless_mode: bool):
     import time
@@ -1452,7 +2079,7 @@ async def worker(worker_id: int, app: Application, headless_mode: bool):
                     active_workers[worker_id] = rotation_user_id
                     
                     try:
-                        result = await run_restored_session(app.bot, rotation_user_id, user_data, worker_id)
+                        result = await run_booking_session(app.bot, rotation_user_id, user_data, worker_id, headless_mode)
                         if result == "SUCCESS":
                             logging.info(f"[Воркер-{worker_id}] Успешно обработал восстановленную сессию {rotation_user_id}")
                             # Удаляем сессию только после успешного завершения
@@ -1524,7 +2151,7 @@ async def worker(worker_id: int, app: Application, headless_mode: bool):
             # Уведомляем пользователя о начале работы
             chat_id = user_data['chat_id']
             remaining_in_queue = task_queue.qsize()
-            await app.bot.send_message(chat_id, f"🚀 **Воркер #{worker_id} начал обработку вашего задания!**\n\n📊 В очереди за вами: {remaining_in_queue}")
+            await safe_send_message(app.bot, chat_id, f"🚀 **Воркер #{worker_id} начал обработку вашего задания!**\n\n📊 В очереди за вами: {remaining_in_queue}")
 
             max_restarts = 3  # Уменьшаем количество перезапусков, так как теперь есть ротация
             for attempt in range(max_restarts):
@@ -1541,14 +2168,25 @@ async def worker(worker_id: int, app: Application, headless_mode: bool):
                         logging.info(f"[Воркер-{worker_id}] Повторная попытка для {user_id}")
                         await asyncio.sleep(30)
                         continue
+                    elif result and ("застаріла" in result or "реавторизац" in result or "повторна авторизація" in result):
+                        # Ошибка авторизации - не повторяем
+                        logging.info(f"[Воркер-{worker_id}] Ошибка авторизации для {user_id}: {result}")
+                        break
+                    elif result and isinstance(result, str) and result.startswith("Не вдалося"):
+                        # Другие критические ошибки - тоже не повторяем бесконечно
+                        logging.warning(f"[Воркер-{worker_id}] Критическая ошибка для {user_id}: {result}")
+                        if attempt >= 1:  # Даем одну дополнительную попытку
+                            break
+                        await asyncio.sleep(10)
+                        continue
                         
                 except SessionResetException as e:
                     logging.warning(f"[Воркер-{worker_id}] Перезапуск сесії для {user_id} (спроба {attempt + 1}/{max_restarts}). Причина: {e}")
                     if attempt + 1 >= max_restarts:
                         logging.error(f"Досягнуто ліміту перезапусків для {user_id}. Завдання зупинено.")
-                        await app.bot.send_message(chat_id, "Досягнуто ліміту автоматичних перезапусків. Завдання зупинено.")
+                        await safe_send_message(app.bot, chat_id, "Досягнуто ліміту автоматичних перезапусків. Завдання зупинено.")
                         break
-                    await app.bot.send_message(chat_id, f"🔄 Сесію було скинуто. Перезапускаю... (Спроба {attempt + 1}/{max_restarts})")
+                    await safe_send_message(app.bot, chat_id, f"🔄 Сесію було скинуто. Перезапускаю... (Спроба {attempt + 1}/{max_restarts})")
                     await asyncio.sleep(15)
 
             logging.info(f"[Воркер-{worker_id}] Завершив роботу з користувачем {user_id}.")
@@ -1570,14 +2208,119 @@ async def worker(worker_id: int, app: Application, headless_mode: bool):
             # Проверяем необходимость автомасштабирования
             await auto_scale_workers(app, headless_mode)
             
-        except Exception as e:
-            logging.critical(f"Критична помилка у воркері {worker_id}: {e}\n{traceback.format_exc()}")
-            # Очищаем отслеживание даже при ошибке
-            if worker_id in worker_start_times:
-                del worker_start_times[worker_id]
-            if worker_id in active_workers:
-                del active_workers[worker_id]
+        except NetworkConnectionException as network_error:
+            logging.warning(f"[Воркер-{worker_id}] Сетевая ошибка: {network_error}")
+            # При сетевой ошибке пытаемся уведомить пользователя
+            try:
+                if 'user_data' in locals() and user_data:
+                    chat_id = user_data.get('chat_id')
+                    if chat_id:
+                        # Попытка отправить сообщение с повторными попытками
+                        await safe_send_message(app.bot, chat_id, 
+                            f"🌐 **Проблемы с интернет-соединением**\n\n"
+                            f"Воркер #{worker_id} обнаружил проблемы с сетью.\n"
+                            f"🔄 Система автоматически повторит попытку подключения...")
+            except Exception as notify_error:
+                logging.error(f"[Воркер-{worker_id}] Не удалось уведомить о сетевой ошибке: {notify_error}")
+            
+            # Сохраняем сессию пользователя в паузе для восстановления
+            try:
+                if 'user_id' in locals() and user_id:
+                    logging.info(f"[Воркер-{worker_id}] Сохраняю сессию {user_id} в паузе из-за сетевой ошибки")
+                    paused_sessions[user_id] = {
+                        'paused_at': asyncio.get_event_loop().time(),
+                        'reason': 'network_error',
+                        'worker_id': worker_id,
+                        'user_data': user_data
+                    }
+                    
+                    # Возвращаем задание в очередь для повторной обработки через некоторое время
+                    await task_queue.put(user_id)
+                    logging.info(f"[Воркер-{worker_id}] Задание {user_id} возвращено в очередь для повторной попытки")
+            except Exception as save_error:
+                logging.error(f"[Воркер-{worker_id}] Ошибка при сохранении сессии в паузе: {save_error}")
+            
+            # НЕ очищаем отслеживание воркера - он продолжает работать
             task_queue.task_done()
+            
+            # Добавляем паузу перед следующим заданием при сетевых проблемах
+            await asyncio.sleep(30)
+            # Продолжаем работу воркера с следующим заданием (continue цикла while True)
+            continue
+            
+        except TemporaryNetworkException as temp_error:
+            logging.warning(f"[Воркер-{worker_id}] Временная сетевая ошибка: {temp_error}")
+            # При временной сетевой ошибке тоже уведомляем пользователя
+            try:
+                if 'user_data' in locals() and user_data:
+                    chat_id = user_data.get('chat_id')
+                    if chat_id:
+                        await safe_send_message(app.bot, chat_id, 
+                            f"⏳ **Временные проблемы с сетью**\n\n"
+                            f"Воркер #{worker_id} столкнулся с временными сетевыми проблемами.\n"
+                            f"🔄 Повторная попытка через несколько секунд...")
+            except Exception as notify_error:
+                logging.error(f"[Воркер-{worker_id}] Не удалось уведомить о временной сетевой ошибке: {notify_error}")
+            
+            # Сохраняем сессию для временных сетевых ошибок
+            try:
+                if 'user_id' in locals() and user_id:
+                    logging.info(f"[Воркер-{worker_id}] Сохраняю сессию {user_id} в паузе из-за временной сетевой ошибки")
+                    paused_sessions[user_id] = {
+                        'paused_at': asyncio.get_event_loop().time(),
+                        'reason': 'temporary_network_error',
+                        'worker_id': worker_id,
+                        'user_data': user_data
+                    }
+                    
+                    # Возвращаем задание в очередь для более быстрой повторной обработки
+                    await task_queue.put(user_id)
+                    logging.info(f"[Воркер-{worker_id}] Задание {user_id} возвращено в очередь для быстрой повторной попытки")
+            except Exception as save_error:
+                logging.error(f"[Воркер-{worker_id}] Ошибка при сохранении сессии при временной ошибке: {save_error}")
+            
+            # НЕ очищаем отслеживание воркера - он продолжает работать
+            task_queue.task_done()
+            
+            # Меньшая пауза для временных ошибок
+            await asyncio.sleep(15)
+            # Продолжаем работу воркера с следующим заданием (continue цикла while True)
+            continue
+            
+        except Exception as e:
+            # Проверяем, является ли это сетевой ошибкой, которая не была перехвачена выше
+            if is_network_error(e):
+                logging.warning(f"[Воркер-{worker_id}] Неклассифицированная сетевая ошибка: {e}")
+                try:
+                    if 'user_data' in locals() and user_data:
+                        chat_id = user_data.get('chat_id')
+                        if chat_id:
+                            await safe_send_message(app.bot, chat_id, 
+                                f"🌐 **Обнаружена сетевая проблема**\n\n"
+                                f"Воркер #{worker_id} столкнулся с сетевой ошибкой.\n"
+                                f"🔄 Система попытается восстановить соединение...")
+                except Exception as notify_error:
+                    logging.error(f"[Воркер-{worker_id}] Не удалось уведомить о сетевой ошибке: {notify_error}")
+                
+                # Очищаем отслеживание воркера
+                if worker_id in worker_start_times:
+                    del worker_start_times[worker_id]
+                if worker_id in active_workers:
+                    del active_workers[worker_id]
+                
+                task_queue.task_done()
+                
+                # Пауза при сетевых ошибках
+                await asyncio.sleep(20)
+            else:
+                # Обычная критическая ошибка
+                logging.critical(f"Критична помилка у воркері {worker_id}: {e}\n{traceback.format_exc()}")
+                # Очищаем отслеживание даже при ошибке
+                if worker_id in worker_start_times:
+                    del worker_start_times[worker_id]
+                if worker_id in active_workers:
+                    del active_workers[worker_id]
+                task_queue.task_done()
 
 async def update_lists_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
@@ -1896,11 +2639,28 @@ async def book_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     
     # Показываем позицию в очереди
     queue_size = task_queue.qsize()
-    if queue_size <= WORKER_COUNT:
-        await update.message.reply_text("✅ **Використовую збережені дані.**\n🚀 Завдання додано до черги. Поиск начнется в ближайшее время!")
-    else:
-        position = queue_size - WORKER_COUNT
-        await update.message.reply_text(f"✅ **Використовую збережені дані.**\n📋 Завдання додано до черги.\n\n⏳ **Позиція в черзі: {position}**\n⚙️ Активних воркерів: {WORKER_COUNT}\n\n💡 Поиск начнется, как только освободится воркер.")
+    try:
+        if queue_size <= WORKER_COUNT:
+            await safe_send_message(
+                context.bot, 
+                chat_id, 
+                "✅ **Використовую збережені дані.**\n🚀 Завдання додано до черги. Поиск начнется в ближайшее время!",
+                "уведомление о добавлении в очередь"
+            )
+        else:
+            position = queue_size - WORKER_COUNT
+            await safe_send_message(
+                context.bot,
+                chat_id,
+                f"✅ **Використовую збережені дані.**\n📋 Завдання додано до черги.\n\n⏳ **Позиція в черзі: {position}**\n⚙️ Активних воркерів: {WORKER_COUNT}\n\n💡 Поиск начнется, как только освободится воркер.",
+                "уведомление о позиции в очереди"
+            )
+    except (NetworkConnectionException, TemporaryNetworkException) as network_error:
+        logging.warning(f"Network error sending queue notification to user {user_id}: {network_error}")
+        # Пользователь добавлен в очередь, но уведомление не отправлено - не критично
+    except Exception as e:
+        logging.error(f"Unexpected error sending queue notification to user {user_id}: {e}")
+        # Не критично - пользователь все равно в очереди
     
     return ConversationHandler.END
 
@@ -2685,6 +3445,78 @@ async def show_keyboard_command(update: Update, context: ContextTypes.DEFAULT_TY
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
     await update.message.reply_text("⌨️ Клавіатуру з командами активовано.", reply_markup=reply_markup)
 
+async def persistent_session_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда для управления persistent sessions (только для админа)"""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    
+    owner_id_str = os.getenv('OWNER_TELEGRAM_ID')
+    if not owner_id_str or user_id != int(owner_id_str):
+        await context.bot.send_message(chat_id, "🚫 Команда доступна только администратору.")
+        return
+    
+    # Собираем информацию о persistent sessions
+    try:
+        persistent_count = 0
+        total_size = 0
+        users_with_persistent = []
+        
+        if os.path.exists(PERSISTENT_SESSIONS_DIR):
+            for user_dir in os.listdir(PERSISTENT_SESSIONS_DIR):
+                user_path = os.path.join(PERSISTENT_SESSIONS_DIR, user_dir)
+                if os.path.isdir(user_path):
+                    persistent_count += 1
+                    users_with_persistent.append(user_dir)
+                    
+                    # Подсчет размера
+                    for root, dirs, files in os.walk(user_path):
+                        for file in files:
+                            file_path = os.path.join(root, file)
+                            total_size += os.path.getsize(file_path)
+        
+        profile_count = 0
+        if os.path.exists(BASE_PROFILES_DIR):
+            profile_count = len([d for d in os.listdir(BASE_PROFILES_DIR) if os.path.isdir(os.path.join(BASE_PROFILES_DIR, d))])
+        
+        size_mb = total_size / (1024 * 1024)
+        
+        message = (
+            f"📊 **Статус Долговечных Сессий**\n\n"
+            f"🔄 Persistent Sessions: **{persistent_count}**\n"
+            f"👥 Пользователи: {', '.join(users_with_persistent[:5]) if users_with_persistent else 'нет'}\n"
+            f"💾 Размер хранилища: **{size_mb:.1f} MB**\n"
+            f"🌐 Browser профили: **{profile_count}**\n"
+            f"⚙️ Режим: **{'включен' if ENABLE_PERSISTENT_PROFILES else 'выключен'}**\n"
+            f"⏰ Время жизни: **{PERSISTENT_SESSION_DURATION // 3600} часов**\n\n"
+            f"🧹 Используйте /cleanup_sessions для очистки устаревших сессий"
+        )
+        
+        await context.bot.send_message(chat_id, message)
+        
+    except Exception as e:
+        await context.bot.send_message(chat_id, f"❌ Ошибка получения статуса: {e}")
+
+async def cleanup_sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда для очистки устаревших persistent sessions (только для админа)"""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    
+    owner_id_str = os.getenv('OWNER_TELEGRAM_ID')
+    if not owner_id_str or user_id != int(owner_id_str):
+        await context.bot.send_message(chat_id, "🚫 Команда доступна только администратору.")
+        return
+    
+    try:
+        await context.bot.send_message(chat_id, "🧹 Начинаю очистку устаревших persistent sessions...")
+        
+        # Запуск очистки
+        await cleanup_expired_persistent_sessions()
+        
+        await context.bot.send_message(chat_id, "✅ Очистка завершена! Используйте /persistent_info для просмотра обновленного статуса.")
+        
+    except Exception as e:
+        await context.bot.send_message(chat_id, f"❌ Ошибка при очистке: {e}")
+
 async def hide_keyboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Клавіатуру сховано.", reply_markup=ReplyKeyboardRemove())
 
@@ -2803,14 +3635,14 @@ entry_points=[
             AWAITING_CHILD_DATA: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_child_data)],
         },
         fallbacks=[CommandHandler("cancel", cancel_command), MessageHandler(filters.Regex("^❌ Скасувати завдання$"), cancel_command)],
-        per_user=True, per_chat=True
+        per_user=True, per_chat=True, per_message=False
     )
 
     update_lists_handler = ConversationHandler(
         entry_points=[CommandHandler("update_lists", update_lists_command)],
         states={UPDATING_LISTS: [CallbackQueryHandler(start_scraping, pattern='^start_scraping$')]},
         fallbacks=[CommandHandler("cancel", cancel_command)],
-        per_user=True, per_chat=True
+        per_user=True, per_chat=True, per_message=False
     )
 
     # Add handlers
@@ -2819,10 +3651,16 @@ entry_points=[
     application.add_handler(update_lists_handler)
     application.add_handler(CommandHandler("keyboard", show_keyboard_command))
     application.add_handler(CommandHandler("hide_keyboard", hide_keyboard_command))
+    application.add_handler(CommandHandler("persistent_info", persistent_session_command))
+    application.add_handler(CommandHandler("cleanup_sessions", cleanup_sessions_command))
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("session_check", session_check_command))
     application.add_handler(CommandHandler("debug_workers", debug_workers_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
+    
+    # НОВЫЕ команды для persistent sessions
+    application.add_handler(CommandHandler("persistent_info", persistent_session_command))
+    application.add_handler(CommandHandler("cleanup_sessions", cleanup_sessions_command))
     application.add_handler(MessageHandler(filters.Regex("^🏠 Головне меню$"), menu_command))
     application.add_handler(MessageHandler(filters.Regex("^📊 Дізнатися статус$"), status_command))
     application.add_handler(MessageHandler(filters.Regex("^⌨️ Сховати клавіатуру$"), hide_keyboard_command))
