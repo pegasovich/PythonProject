@@ -26,6 +26,58 @@ class SessionResetException(Exception):
     """Исключение, вызываемое при сбросе сессии на сайте."""
     pass
 
+def parse_jwt_token(token, silent=False):
+    """
+    Парсит JWT токен и извлекает информацию о времени истечения
+    
+    Args:
+        token: JWT токен
+        silent: не выводить сообщения в лог (по умолчанию False)
+        
+    Returns:
+        dict: словарь с информацией о токене или None если парсинг не удался
+    """
+    try:
+        import base64
+        import json
+        
+        # Извлекаем payload из JWT токена
+        payload = token.split('.')[1]
+        payload += '=' * (4 - len(payload) % 4)
+        decoded = base64.b64decode(payload)
+        jwt_data = json.loads(decoded)
+        
+        result = {}
+        
+        # Извлекаем время истечения
+        exp_time = jwt_data.get('exp')
+        if exp_time:
+            exp_datetime = datetime.fromtimestamp(exp_time)
+            remaining_hours = (exp_time - datetime.now().timestamp()) / 3600
+            
+            result.update({
+                'exp_time': exp_time,
+                'exp_datetime': exp_datetime.isoformat(),
+                'remaining_hours': remaining_hours
+            })
+            
+            if not silent:
+                print_timestamped(f"🕐 Токен действует до: {exp_datetime}")
+                print_timestamped(f"⏱️  Продолжительность: {remaining_hours:.1f} часов")
+        
+        # Извлекаем embedded refresh token если есть
+        if 'authTokens' in jwt_data and 'refreshToken' in jwt_data['authTokens']:
+            result['embedded_refresh_token'] = jwt_data['authTokens']['refreshToken']
+            if not silent:
+                print_timestamped("🔄 Найден embedded refresh token")
+        
+        return result
+        
+    except Exception as e:
+        if not silent:
+            print_timestamped(f"⚠️ Ошибка парсинга JWT токена: {e}")
+        return None
+
 async def smart_find_element(page, selectors_list, element_description="элемент", timeout=None):
     """
     Умный поиск элемента с несколькими селекторами и детальным логированием
@@ -228,24 +280,45 @@ async def extract_tokens_from_browser(page):
                         token_data = json.loads(value)
                         if 'access_token' in token_data or 'accessToken' in token_data:
                             access_token = token_data.get('access_token') or token_data.get('accessToken')
+                            
+                            # Парсим JWT для извлечения актуального timestamp
+                            jwt_info = parse_jwt_token(access_token)
+                            
                             OAUTH_TOKENS.update({
                                 'access_token': access_token,
                                 'method': 'browser_extracted',
                                 'extracted_from': 'localStorage',
-                                'storage_key': key
+                                'storage_key': key,
+                                'timestamp': datetime.now().isoformat()
                             })
+                            
+                            # Добавляем информацию о времени истечения из JWT
+                            if jwt_info:
+                                OAUTH_TOKENS.update(jwt_info)
+                            
                             print_timestamped(f"✅ Токен извлечен из localStorage ключ: {key}")
+                            await save_oauth_tokens()  # Сохраняем обновленную информацию
                             return
                     else:
                         # Обычная строка, возможно это сам токен
                         if len(value) > 20:  # Минимальная длина токена
+                            # Парсим JWT для извлечения актуального timestamp
+                            jwt_info = parse_jwt_token(value)
+                            
                             OAUTH_TOKENS.update({
                                 'access_token': value,
                                 'method': 'browser_extracted',
                                 'extracted_from': 'localStorage',
-                                'storage_key': key
+                                'storage_key': key,
+                                'timestamp': datetime.now().isoformat()
                             })
+                            
+                            # Добавляем информацию о времени истечения из JWT
+                            if jwt_info:
+                                OAUTH_TOKENS.update(jwt_info)
+                            
                             print_timestamped(f"✅ Токен извлечен из localStorage ключ: {key}")
+                            await save_oauth_tokens()  # Сохраняем обновленную информацию
                             return
                 except:
                     pass
@@ -260,23 +333,44 @@ async def extract_tokens_from_browser(page):
                         token_data = json.loads(value)
                         if 'access_token' in token_data or 'accessToken' in token_data:
                             access_token = token_data.get('access_token') or token_data.get('accessToken')
+                            
+                            # Парсим JWT для извлечения актуального timestamp
+                            jwt_info = parse_jwt_token(access_token)
+                            
                             OAUTH_TOKENS.update({
                                 'access_token': access_token,
                                 'method': 'browser_extracted',
                                 'extracted_from': 'sessionStorage',
-                                'storage_key': key
+                                'storage_key': key,
+                                'timestamp': datetime.now().isoformat()
                             })
+                            
+                            # Добавляем информацию о времени истечения из JWT
+                            if jwt_info:
+                                OAUTH_TOKENS.update(jwt_info)
+                            
                             print_timestamped(f"✅ Токен извлечен из sessionStorage ключ: {key}")
+                            await save_oauth_tokens()  # Сохраняем обновленную информацию
                             return
                     else:
                         if len(value) > 20:
+                            # Парсим JWT для извлечения актуального timestamp
+                            jwt_info = parse_jwt_token(value)
+                            
                             OAUTH_TOKENS.update({
                                 'access_token': value,
                                 'method': 'browser_extracted',
                                 'extracted_from': 'sessionStorage',
-                                'storage_key': key
+                                'storage_key': key,
+                                'timestamp': datetime.now().isoformat()
                             })
+                            
+                            # Добавляем информацию о времени истечения из JWT
+                            if jwt_info:
+                                OAUTH_TOKENS.update(jwt_info)
+                            
                             print_timestamped(f"✅ Токен извлечен из sessionStorage ключ: {key}")
+                            await save_oauth_tokens()  # Сохраняем обновленную информацию
                             return
                 except:
                     pass
@@ -287,13 +381,23 @@ async def extract_tokens_from_browser(page):
             if any(token_key in cookie['name'].lower() for token_key in ['access', 'token', 'auth', 'bearer', 'jwt']):
                 print_timestamped(f"🔍 Найден потенциальный токен в cookies: {cookie['name']}")
                 if len(cookie['value']) > 20:
+                    # Парсим JWT для извлечения актуального timestamp
+                    jwt_info = parse_jwt_token(cookie['value'])
+                    
                     OAUTH_TOKENS.update({
                         'access_token': cookie['value'],
                         'method': 'browser_extracted',
                         'extracted_from': 'cookies',
-                        'storage_key': cookie['name']
+                        'storage_key': cookie['name'],
+                        'timestamp': datetime.now().isoformat()
                     })
+                    
+                    # Добавляем информацию о времени истечения из JWT
+                    if jwt_info:
+                        OAUTH_TOKENS.update(jwt_info)
+                    
                     print_timestamped(f"✅ Токен извлечен из cookies: {cookie['name']}")
+                    await save_oauth_tokens()  # Сохраняем обновленную информацию
                     return
         
         print_timestamped("❌ Токены не найдены в браузере")
@@ -1425,17 +1529,13 @@ async def show_oauth_status():
         if OAUTH_TOKENS.get('access_token', '').count('.') == 2:
             status_msg += "🎫 **Тип токена**: JWT (с embedded refresh token)\n"
             
-            try:
-                import base64
-                payload = OAUTH_TOKENS['access_token'].split('.')[1]
-                payload += '=' * (4 - len(payload) % 4)
-                decoded = base64.b64decode(payload)
-                jwt_data = json.loads(decoded)
+            # Используем сохраненные данные о времени истечения, если доступны
+            if 'exp_datetime' in OAUTH_TOKENS and 'remaining_hours' in OAUTH_TOKENS:
+                exp_datetime_str = OAUTH_TOKENS['exp_datetime']
+                remaining_hours = OAUTH_TOKENS['remaining_hours']
                 
-                exp_time = jwt_data.get('exp')
-                if exp_time:
-                    exp_datetime = datetime.fromtimestamp(exp_time)
-                    remaining_hours = (exp_time - datetime.now().timestamp()) / 3600
+                try:
+                    exp_datetime = datetime.fromisoformat(exp_datetime_str.replace('Z', '+00:00'))
                     
                     if remaining_hours > 0:
                         status_msg += f"✅ **Действует до**: {exp_datetime.strftime('%d.%m.%Y %H:%M')}\n"
@@ -1443,15 +1543,59 @@ async def show_oauth_status():
                     else:
                         status_msg += f"❌ **Истек**: {abs(remaining_hours):.1f} часов назад\n"
                         status_msg += "🔄 **Будет обновлен** при следующем запуске\n"
+                        
+                except Exception:
+                    # Fallback на парсинг JWT если сохраненные данные повреждены
+                    try:
+                        import base64
+                        payload = OAUTH_TOKENS['access_token'].split('.')[1]
+                        payload += '=' * (4 - len(payload) % 4)
+                        decoded = base64.b64decode(payload)
+                        jwt_data = json.loads(decoded)
+                        
+                        exp_time = jwt_data.get('exp')
+                        if exp_time:
+                            exp_datetime = datetime.fromtimestamp(exp_time)
+                            remaining_hours = (exp_time - datetime.now().timestamp()) / 3600
+                            
+                            if remaining_hours > 0:
+                                status_msg += f"✅ **Действует до**: {exp_datetime.strftime('%d.%m.%Y %H:%M')}\n"
+                                status_msg += f"⏱️ **Осталось**: {remaining_hours:.1f} часов\n"
+                            else:
+                                status_msg += f"❌ **Истек**: {abs(remaining_hours):.1f} часов назад\n"
+                                status_msg += "🔄 **Будет обновлен** при следующем запуске\n"
+                        
+                    except Exception as e:
+                        status_msg += f"⚠️ **Ошибка анализа JWT**: {e}\n"
+            else:
+                # Парсим JWT если нет сохраненных данных
+                try:
+                    import base64
+                    payload = OAUTH_TOKENS['access_token'].split('.')[1]
+                    payload += '=' * (4 - len(payload) % 4)
+                    decoded = base64.b64decode(payload)
+                    jwt_data = json.loads(decoded)
                     
-                    # Проверяем refresh token
-                    if 'authTokens' in jwt_data and 'refreshToken' in jwt_data['authTokens']:
-                        refresh_token = jwt_data['authTokens']['refreshToken']
-                        status_msg += f"🔄 **Refresh Token**: Доступен ({refresh_token[:20]}...)\n"
-                        status_msg += "✨ **Автообновление**: Поддерживается\n"
+                    exp_time = jwt_data.get('exp')
+                    if exp_time:
+                        exp_datetime = datetime.fromtimestamp(exp_time)
+                        remaining_hours = (exp_time - datetime.now().timestamp()) / 3600
+                        
+                        if remaining_hours > 0:
+                            status_msg += f"✅ **Действует до**: {exp_datetime.strftime('%d.%m.%Y %H:%M')}\n"
+                            status_msg += f"⏱️ **Осталось**: {remaining_hours:.1f} часов\n"
+                        else:
+                            status_msg += f"❌ **Истек**: {abs(remaining_hours):.1f} часов назад\n"
+                            status_msg += "🔄 **Будет обновлен** при следующем запуске\n"
                     
-            except Exception as e:
-                status_msg += f"⚠️ **Ошибка анализа JWT**: {e}\n"
+                except Exception as e:
+                    status_msg += f"⚠️ **Ошибка анализа JWT**: {e}\n"
+            
+            # Проверяем refresh token
+            if OAUTH_TOKENS.get('embedded_refresh_token'):
+                refresh_token = OAUTH_TOKENS['embedded_refresh_token']
+                status_msg += f"🔄 **Refresh Token**: Доступен ({refresh_token[:20]}...)\n"
+                status_msg += "✨ **Автообновление**: Поддерживается\n"
         else:
             status_msg += "🎫 **Тип токена**: Обычный OAuth\n"
         
