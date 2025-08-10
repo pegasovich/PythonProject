@@ -1295,11 +1295,14 @@ async def apply_oauth_session(page):
         if extracted_from == 'localStorage':
             # Инжектируем токен в localStorage с тем же ключом, что использовался
             if storage_key == 'token':
-                # Если токен был JWT, сохраняем его как есть
+                # Если токен был JWT, сохраняем его как есть + дублируем в несколько мест
                 await page.evaluate(f"""
                     localStorage.setItem('{storage_key}', '{OAUTH_TOKENS["access_token"]}');
+                    localStorage.setItem('access_token', '{OAUTH_TOKENS["access_token"]}');
+                    localStorage.setItem('authToken', '{OAUTH_TOKENS["access_token"]}');
+                    localStorage.setItem('jwt_token', '{OAUTH_TOKENS["access_token"]}');
                 """)
-                print_timestamped(f"💾 Токен внедрен в localStorage['{storage_key}']")
+                print_timestamped(f"💾 Токен внедрен в localStorage['{storage_key}'] + дубликаты для надежности")
             else:
                 # Для других форматов токенов
                 await page.evaluate(f"""
@@ -1324,13 +1327,33 @@ async def apply_oauth_session(page):
             }])
             print_timestamped(f"🍪 Токен внедрен как cookie '{storage_key}'")
         else:
-            # Фоллбэк - пробуем стандартные варианты
+            # Фоллбэк - пробуем все возможные варианты одновременно
             await page.evaluate(f"""
+                // localStorage варианты
                 localStorage.setItem('token', '{OAUTH_TOKENS["access_token"]}');
                 localStorage.setItem('access_token', '{OAUTH_TOKENS["access_token"]}');
+                localStorage.setItem('authToken', '{OAUTH_TOKENS["access_token"]}');
+                localStorage.setItem('jwt_token', '{OAUTH_TOKENS["access_token"]}');
+                localStorage.setItem('bearer_token', '{OAUTH_TOKENS["access_token"]}');
                 localStorage.setItem('token_type', 'Bearer');
+                
+                // sessionStorage варианты
+                sessionStorage.setItem('token', '{OAUTH_TOKENS["access_token"]}');
+                sessionStorage.setItem('access_token', '{OAUTH_TOKENS["access_token"]}');
+                sessionStorage.setItem('authToken', '{OAUTH_TOKENS["access_token"]}');
             """)
-            print_timestamped("💾 Токен внедрен в localStorage (fallback режим)")
+            
+            # Также добавляем cookies
+            try:
+                await page.context.add_cookies([
+                    {'name': 'token', 'value': OAUTH_TOKENS["access_token"], 'domain': '.e-consul.gov.ua', 'path': '/'},
+                    {'name': 'access_token', 'value': OAUTH_TOKENS["access_token"], 'domain': '.e-consul.gov.ua', 'path': '/'},
+                    {'name': 'authToken', 'value': OAUTH_TOKENS["access_token"], 'domain': '.e-consul.gov.ua', 'path': '/'}
+                ])
+            except Exception as cookie_error:
+                print_timestamped(f"⚠️ Не удалось добавить cookies: {cookie_error}")
+            
+            print_timestamped("💾 Токен внедрен везде (fallback режим: localStorage + sessionStorage + cookies)")
         
         # Перезагружаем страницу для применения токена
         print_timestamped("🔄 Перезагружаю страницу для применения токена...")
@@ -1348,7 +1371,29 @@ async def apply_oauth_session(page):
             await send_telegram_message("🔐 Вход выполнен через сохраненную OAuth сессию", is_verbose=False)
             return True
         else:
-            print_timestamped("❌ OAuth сессия не сработала, требуется повторная авторизация")
+            print_timestamped("❌ OAuth сессия не сработала, пробую обновить токен...")
+            
+            # ИСПРАВЛЕНИЕ: Попытка обновить токен если сессия не работает
+            if OAUTH_TOKENS.get('embedded_refresh_token'):
+                print_timestamped("🔄 Попытка автоматического обновления токена...")
+                refresh_success = await refresh_jwt_token()
+                if refresh_success:
+                    print_timestamped("✅ Токен обновлен, повторно применяю сессию...")
+                    # Применяем обновленный токен
+                    storage_key = OAUTH_TOKENS.get('storage_key', 'token')
+                    await page.evaluate(f"""
+                        localStorage.setItem('{storage_key}', '{OAUTH_TOKENS["access_token"]}');
+                    """)
+                    await page.reload(wait_until='networkidle')
+                    
+                    # Проверяем еще раз
+                    is_valid_after_refresh = await check_session_validity(page)
+                    if is_valid_after_refresh:
+                        print_timestamped("✅ OAuth сессия работает после обновления токена!")
+                        await send_telegram_message("🔐 Вход выполнен с обновленным токеном", is_verbose=False)
+                        return True
+            
+            print_timestamped("❌ OAuth сессия не сработала даже после обновления, требуется повторная авторизация")
             return False
     
     except Exception as e:
@@ -3299,16 +3344,41 @@ async def perform_consular_steps(page):
                 await page.wait_for_timeout(CONFIG['reload_delay_seconds'] * 1000)
                 retry_attempts += 1
             else:
-                print_timestamped("!!! ВНИМАНИЕ: Сообщение об отсутствии слотов НЕ найдено. Запускаю автоматическое бронирование! !!!")
-                await send_telegram_message("!!! НАЙДЕНЫ СВОБОДНЫЕ СЛОТЫ! НАЧИНАЮ АВТОМАТИЧЕСКОЕ БРОНИРОВАНИЕ !!!", is_verbose=False)
-                path = await save_screenshot(page, "slots_found_starting_booking")
-                if path:
-                    await send_telegram_photo(path, "Обнаружены возможные слоты. Начинаю процедуру выбора.")
-                booking_result = await book_available_slot(page)
-                if "Успешное" not in booking_result:
-                    await send_telegram_message(f"Автоматическое бронирование не удалось: {booking_result}. Перевожу в ручной режим.", is_verbose=False)
-                    return f"Booking failed. Entering manual mode: {booking_result}"
-                return booking_result
+                print_timestamped("!!! ВНИМАНИЕ: Сообщение об отсутствии слотов НЕ найдено. Проверяю наличие календаря...")
+                
+                # ДОПОЛНИТЕЛЬНАЯ ПРОВЕРКА: Убеждаемся что календарь действительно загружен
+                try:
+                    calendar_container = page.locator('div[class*="scrollbar-container"]')
+                    await calendar_container.wait_for(state='visible', timeout=10000)
+                    
+                    # Проверяем, есть ли вкладки месяцев в календаре
+                    month_tabs_locator = calendar_container.get_by_text(re.compile(r"^\S+ \d{4}$"))
+                    month_tabs_count = await month_tabs_locator.count()
+                    
+                    if month_tabs_count > 0:
+                        print_timestamped(f"!!! КАЛЕНДАРЬ ПОДТВЕРЖДЕН: Найдено {month_tabs_count} месяцев. Запускаю автоматическое бронирование! !!!")
+                        await send_telegram_message("!!! НАЙДЕНЫ СВОБОДНЫЕ СЛОТЫ! НАЧИНАЮ АВТОМАТИЧЕСКОЕ БРОНИРОВАНИЕ !!!", is_verbose=False)
+                        path = await save_screenshot(page, "slots_found_starting_booking")
+                        if path:
+                            await send_telegram_photo(path, "Обнаружены возможные слоты. Начинаю процедуру выбора.")
+                        booking_result = await book_available_slot(page)
+                        if "Успешное" not in booking_result:
+                            await send_telegram_message(f"Автоматическое бронирование не удалось: {booking_result}. Перевожу в ручной режим.", is_verbose=False)
+                            return f"Booking failed. Entering manual mode: {booking_result}"
+                        return booking_result
+                    else:
+                        print_timestamped("!!! ЛОЖНОЕ СРАБАТЫВАНИЕ: Календарь найден, но месяцы отсутствуют. Слотов нет!")
+                        await send_telegram_message("Ложное обнаружение слотов: календарь пуст. Продолжаю поиск...", is_verbose=False)
+                        await page.reload(timeout=CONFIG['timeout'], wait_until='domcontentloaded')
+                        await page.wait_for_timeout(CONFIG['reload_delay_seconds'] * 1000)
+                        retry_attempts += 1
+                        
+                except PlaywrightTimeoutError:
+                    print_timestamped("!!! ЛОЖНОЕ СРАБАТЫВАНИЕ: Календарь не найден. Слотов действительно нет!")
+                    await send_telegram_message("Ложное обнаружение слотов: календарь отсутствует. Продолжаю поиск...", is_verbose=False)
+                    await page.reload(timeout=CONFIG['timeout'], wait_until='domcontentloaded')
+                    await page.wait_for_timeout(CONFIG['reload_delay_seconds'] * 1000)
+                    retry_attempts += 1
         except PlaywrightTimeoutError as e:
             print_timestamped(f"КРИТИЧЕСКИЙ ТАЙМАУТ: Сообщение 'Відбувається пошук активних слотів...' зависло. Перезапускаю сессию. Ошибка: {e}")
             await send_telegram_message(f"КРИТИЧЕСКАЯ ОШИБКА: Зависание при поиске слотов. Перезапуск сессии.", is_verbose=True)
