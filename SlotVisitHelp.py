@@ -1591,6 +1591,112 @@ VERBOSE_TELEGRAM_NOTIFICATIONS = False
 # Инициализация Telegram бота
 bot = Bot(token=CONFIG['telegram_bot_token'])
 
+async def handle_telegram_callback_query(message, last_update_id, expected_callback_prefixes=None, timeout_minutes=3):
+    """
+    Универсальная функция для обработки Telegram callback queries
+    
+    Args:
+        message: сообщение с inline клавиатурой
+        last_update_id: последний ID обновления
+        expected_callback_prefixes: список ожидаемых префиксов callback данных (например, ['gender_', 'service_'])
+        timeout_minutes: таймаут в минутах
+    
+    Returns:
+        tuple: (selected_data, new_last_update_id) или (None, last_update_id) при ошибке
+    """
+    if expected_callback_prefixes is None:
+        expected_callback_prefixes = []
+    
+    timeout_seconds = int(timeout_minutes * 60)
+    for _ in range(timeout_seconds):
+        try:
+            updates = await bot.get_updates(offset=last_update_id, timeout=1)
+            for update in updates:
+                last_update_id = max(last_update_id, update.update_id + 1)
+                if update.callback_query and update.callback_query.message.message_id == message.message_id:
+                    query = update.callback_query
+                    
+                    # Проверяем, соответствует ли callback_data ожидаемым префиксам
+                    if expected_callback_prefixes:
+                        matches = any(query.data.startswith(prefix) for prefix in expected_callback_prefixes)
+                        if not matches:
+                            continue
+                    
+                    await query.answer()
+                    return query.data, last_update_id
+                    
+        except TelegramError as e:
+            if "Timed out" in str(e):
+                print_timestamped("Предупреждение: Таймаут при связи с Telegram. Повторяю попытку...")
+                await asyncio.sleep(2)
+                continue
+            else:
+                raise e
+        await asyncio.sleep(1)
+    
+    print_timestamped(f"Таймаут ожидания ответа пользователя ({timeout_minutes} мин)")
+    return None, last_update_id
+
+async def handle_calendar_selection(last_update_id, timeout_minutes=5):
+    """
+    Универсальная функция для обработки выбора даты в календаре
+    
+    Returns:
+        tuple: (selected_date, new_last_update_id) или (None, last_update_id) при ошибке
+    """
+    current_date = datetime.now()
+    calendar_message = await bot.send_message(
+        chat_id=CONFIG['telegram_chat_id'],
+        text="Тепер оберіть вашу дату народження:",
+        reply_markup=await generate_calendar_keyboard(current_date.year, current_date.month)
+    )
+    
+    dob = None
+    timeout_seconds = int(timeout_minutes * 60)
+    for _ in range(timeout_seconds):
+        try:
+            updates = await bot.get_updates(offset=last_update_id, timeout=1)
+            for update in updates:
+                last_update_id = max(last_update_id, update.update_id + 1)
+                if not update.callback_query or update.callback_query.message.message_id != calendar_message.message_id:
+                    continue
+                query = update.callback_query
+                await query.answer()
+                action, *params = query.data.split('_')
+                if action == "calendar":
+                    if params[0] == "nav":
+                        year, month = map(int, params[1:])
+                        await bot.edit_message_reply_markup(chat_id=query.message.chat.id, message_id=query.message.message_id, reply_markup=await generate_calendar_keyboard(year, month))
+                    elif params[0] == "show" and params[1] == "months":
+                        year, month = map(int, params[2:])
+                        await bot.edit_message_reply_markup(chat_id=query.message.chat.id, message_id=query.message.message_id, reply_markup=await generate_month_selection_keyboard(year, month))
+                    elif params[0] == "show" and params[1] == "years":
+                        year, month = map(int, params[2:])
+                        await bot.edit_message_reply_markup(chat_id=query.message.chat.id, message_id=query.message.message_id, reply_markup=await generate_year_selection_keyboard(year, month))
+                    elif params[0] == "year" and params[1] == "nav":
+                        year, month = map(int, params[2:])
+                        await bot.edit_message_reply_markup(chat_id=query.message.chat.id, message_id=query.message.message_id, reply_markup=await generate_year_selection_keyboard(year, month))
+                    elif params[0] == "select":
+                        year, month, day = map(int, params[1:])
+                        dob = datetime(year, month, day)
+                        selected_date_str = dob.strftime("%d.%m.%Y")
+                        await bot.edit_message_text(text=f"Вибрана дата: {selected_date_str}", chat_id=query.message.chat.id, message_id=query.message.message_id)
+                        print_timestamped(f"Пользователь выбрал дату: {selected_date_str}")
+                        return dob, last_update_id
+        except TelegramError as e:
+            if "Timed out" in str(e):
+                print_timestamped("Предупреждение: Таймаут при связи с Telegram. Повторяю попытку...")
+                await asyncio.sleep(2)
+                continue
+            else:
+                raise e
+        await asyncio.sleep(1)
+    
+    if not dob:
+        await bot.edit_message_text(text="Час очікування вичерпано. Будь ласка, перезапустіть процес.", chat_id=calendar_message.chat.id, message_id=calendar_message.message_id)
+    
+    return dob, last_update_id
+
 async def load_last_user_data():
     """
     НОВАЯ ФУНКЦИЯ: Загружает данные из последнего архива.
@@ -2067,38 +2173,18 @@ async def perform_login_steps(page):
             raise Exception(f"Не удалось отправить сообщение с выбором в Telegram: {e}")
 
         last_update_id = 0
-        # <<< НАЧАЛО ИЗМЕНЕНИЙ: Усиленная защита от сбоев Telegram >>>
-        for _ in range(180):
-            try:
-                updates = await bot.get_updates(offset=last_update_id, timeout=1)
-                for update in updates:
-                    last_update_id = max(last_update_id, update.update_id + 1)
-                    if update.callback_query and update.callback_query.message.message_id == message.message_id:
-                        query = update.callback_query
-                        auth_method = query.data
-                        await query.answer()
-                        await bot.edit_message_text(
-                            chat_id=query.message.chat.id,
-                            message_id=query.message.message_id,
-                            text=f"Вибрано: {auth_method.upper()}"
-                        )
-                        print_timestamped(f"Пользователь выбрал: {auth_method}")
-                        break
-                if auth_method:
-                    break
-            except TelegramError as e:
-                if "Timed out" in str(e):
-                    print_timestamped("Предупреждение: Таймаут при связи с Telegram. Повторяю попытку...")
-                    await asyncio.sleep(2)
-                    continue
-                else:
-                    print_timestamped(f"Критическая ошибка Telegram в perform_login_steps (выбор метода): {e}")
-                    raise e
-            
-            await asyncio.sleep(1)
-        # <<< КОНЕЦ ИЗМЕНЕНИЙ >>>
-
-        if not auth_method:
+        auth_method, last_update_id = await handle_telegram_callback_query(
+            message, last_update_id, ['diia', 'key', 'idgov'], timeout_minutes=3
+        )
+        
+        if auth_method:
+            await bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=message.message_id,
+                text=f"Вибрано: {auth_method.upper()}"
+            )
+            print_timestamped(f"Пользователь выбрал: {auth_method}")
+        else:
             try:
                 await bot.edit_message_text(
                     chat_id=message.chat.id,
@@ -2669,38 +2755,21 @@ async def perform_consular_steps(page):
                 text="Оберіть стать:",
                 reply_markup=gender_reply_markup
             )
-            # <<< НАЧАЛО ИЗМЕНЕНИЙ: Усиленная защита от сбоев Telegram >>>
-            for _ in range(180):
-                try:
-                    updates = await bot.get_updates(offset=last_update_id, timeout=1)
-                    for update in updates:
-                        last_update_id = max(last_update_id, update.update_id + 1)
-                        if update.callback_query and update.callback_query.message.message_id == gender_message.message_id:
-                            query = update.callback_query
-                            if query.data in ['gender_female', 'gender_male']:
-                                selected_gender = query.data.split('_')[1]
-                                await query.answer()
-                                gender_text = "Жіноча" if selected_gender == 'female' else "Чоловіча"
-                                await bot.edit_message_text(
-                                    chat_id=query.message.chat.id,
-                                    message_id=query.message.message_id,
-                                    text=f"Вибрано стать: {gender_text}"
-                                )
-                                print_timestamped(f"Пользователь выбрал стать: {gender_text}")
-                                break
-                    if selected_gender:
-                        break
-                except TelegramError as e:
-                    if "Timed out" in str(e):
-                        print_timestamped("Предупреждение: Таймаут при связи с Telegram. Повторяю попытку...")
-                        await asyncio.sleep(2)
-                        continue
-                    else:
-                        raise e
-                await asyncio.sleep(1)
-            # <<< КОНЕЦ ИЗМЕНЕНИЙ >>>
-
-            if not selected_gender:
+            
+            selected_gender_data, last_update_id = await handle_telegram_callback_query(
+                gender_message, last_update_id, ['gender_'], timeout_minutes=3
+            )
+            
+            if selected_gender_data:
+                selected_gender = selected_gender_data.split('_')[1]
+                gender_text = "Жіноча" if selected_gender == 'female' else "Чоловіча"
+                await bot.edit_message_text(
+                    chat_id=gender_message.chat.id,
+                    message_id=gender_message.message_id,
+                    text=f"Вибрано стать: {gender_text}"
+                )
+                print_timestamped(f"Пользователь выбрал стать: {gender_text}")
+            else:
                 raise Exception("Пользователь не выбрал стать в течение 3 минут.")
             USER_DATA['gender'] = selected_gender
 
@@ -2716,57 +2785,11 @@ async def perform_consular_steps(page):
                 dob = None
 
         if not dob:
-            current_date = datetime.now()
-            calendar_message = await bot.send_message(
-                chat_id=CONFIG['telegram_chat_id'],
-                text="Тепер оберіть вашу дату народження:",
-                reply_markup=await generate_calendar_keyboard(current_date.year, current_date.month)
-            )
-            # <<< НАЧАЛО ИЗМЕНЕНИЙ: Усиленная защита от сбоев Telegram >>>
-            for _ in range(300):
-                try:
-                    updates = await bot.get_updates(offset=last_update_id, timeout=1)
-                    for update in updates:
-                        last_update_id = max(last_update_id, update.update_id + 1)
-                        if not update.callback_query or update.callback_query.message.message_id != calendar_message.message_id:
-                            continue
-                        query = update.callback_query
-                        await query.answer()
-                        action, *params = query.data.split('_')
-                        if action == "calendar":
-                            if params[0] == "nav":
-                                year, month = map(int, params[1:])
-                                await bot.edit_message_reply_markup(chat_id=query.message.chat.id, message_id=query.message.message_id, reply_markup=await generate_calendar_keyboard(year, month))
-                            elif params[0] == "show" and params[1] == "months":
-                                year, month = map(int, params[2:])
-                                await bot.edit_message_reply_markup(chat_id=query.message.chat.id, message_id=query.message.message_id, reply_markup=await generate_month_selection_keyboard(year, month))
-                            elif params[0] == "show" and params[1] == "years":
-                                year, month = map(int, params[2:])
-                                await bot.edit_message_reply_markup(chat_id=query.message.chat.id, message_id=query.message.message_id, reply_markup=await generate_year_selection_keyboard(year, month))
-                            elif params[0] == "year" and params[1] == "nav":
-                                year, month = map(int, params[2:])
-                                await bot.edit_message_reply_markup(chat_id=query.message.chat.id, message_id=query.message.message_id, reply_markup=await generate_year_selection_keyboard(year, month))
-                            elif params[0] == "select":
-                                year, month, day = map(int, params[1:])
-                                dob = datetime(year, month, day)
-                                selected_date_str = dob.strftime("%d.%m.%Y")
-                                USER_DATA['date_of_birth'] = selected_date_str
-                                await bot.edit_message_text(text=f"Вибрана дата: {selected_date_str}", chat_id=query.message.chat.id, message_id=query.message.message_id)
-                                print_timestamped(f"Пользователь выбрал дату: {selected_date_str}")
-                                break
-                    if dob:
-                        break
-                except TelegramError as e:
-                    if "Timed out" in str(e):
-                        print_timestamped("Предупреждение: Таймаут при связи с Telegram. Повторяю попытку...")
-                        await asyncio.sleep(2)
-                        continue
-                    else:
-                        raise e
-                await asyncio.sleep(1)
-             # <<< КОНЕЦ ИЗМЕНЕНИЙ >>>
-            if not dob:
-                await bot.edit_message_text(text="Час очікування вичерпано. Будь ласка, перезапустіть процес.", chat_id=calendar_message.chat.id, message_id=calendar_message.message_id)
+            dob, last_update_id = await handle_calendar_selection(last_update_id, timeout_minutes=5)
+            if dob:
+                selected_date_str = dob.strftime("%d.%m.%Y")
+                USER_DATA['date_of_birth'] = selected_date_str
+            else:
                 raise Exception("Пользователь не выбрал дату рождения в течение 5 минут.")
 
         print_timestamped("Заполняю данные заявителя на странице...")
@@ -3117,39 +3140,21 @@ async def perform_consular_steps(page):
             recipient_reply_markup = InlineKeyboardMarkup(recipient_keyboard)
             recipient_message = await bot.send_message(chat_id=CONFIG['telegram_chat_id'], text="Отримати послугу плануєте:", reply_markup=recipient_reply_markup)
             
-            # <<< НАЧАЛО ИЗМЕНЕНИЙ: Усиленная защита от сбоев Telegram >>>
-            for _ in range(180):
-                try:
-                    updates = await bot.get_updates(offset=last_update_id, timeout=1)
-                    for update in updates:
-                        last_update_id = max(last_update_id, update.update_id + 1)
-                        if update.callback_query and update.callback_query.message.message_id == recipient_message.message_id:
-                            query = update.callback_query
-                            if query.data.startswith("recipient_"):
-                                selected_recipient_key = query.data.split('_')[1]
-                                if selected_recipient_key == 'self':
-                                    print_timestamped("Выбрано 'Для себе'. Очищаю старые данные о ребенке, если они есть.")
-                                    USER_DATA.pop('child_surname', None)
-                                    USER_DATA.pop('child_firstname', None)
-                                    USER_DATA.pop('child_middlename', None)
-                                selected_recipient_text = recipient_options[selected_recipient_key]
-                                await query.answer()
-                                await bot.edit_message_text(chat_id=query.message.chat.id, message_id=query.message.message_id, text=f"Послуга для: {selected_recipient_text}")
-                                print_timestamped(f"Пользователь выбрал получателя: {selected_recipient_text}")
-                                break
-                    if selected_recipient_key:
-                        break
-                except TelegramError as e:
-                    if "Timed out" in str(e):
-                        print_timestamped("Предупреждение: Таймаут при связи с Telegram. Повторяю попытку...")
-                        await asyncio.sleep(2)
-                        continue
-                    else:
-                        raise e
-                await asyncio.sleep(1)
-            # <<< КОНЕЦ ИЗМЕНЕНИЙ >>>
-
-            if not selected_recipient_key:
+            selected_recipient_data, last_update_id = await handle_telegram_callback_query(
+                recipient_message, last_update_id, ['recipient_'], timeout_minutes=3
+            )
+            
+            if selected_recipient_data:
+                selected_recipient_key = selected_recipient_data.split('_')[1]
+                if selected_recipient_key == 'self':
+                    print_timestamped("Выбрано 'Для себе'. Очищаю старые данные о ребенке, если они есть.")
+                    USER_DATA.pop('child_surname', None)
+                    USER_DATA.pop('child_firstname', None)
+                    USER_DATA.pop('child_middlename', None)
+                selected_recipient_text = recipient_options[selected_recipient_key]
+                await bot.edit_message_text(chat_id=recipient_message.chat.id, message_id=recipient_message.message_id, text=f"Послуга для: {selected_recipient_text}")
+                print_timestamped(f"Пользователь выбрал получателя: {selected_recipient_text}")
+            else:
                 raise Exception("Пользователь не выбрал получателя услуги в течение 3 минут.")
             USER_DATA['service_recipient'] = selected_recipient_key
         child_surname, child_firstname, child_middlename = "", "", ""
@@ -3228,11 +3233,37 @@ async def perform_consular_steps(page):
         if "dateAndTimeVisitInfo" not in current_url:
             if "consularServiceInfo" in current_url:
                 print_timestamped(f"📋 Система перенаправила на обновление данных услуги: {current_url}")
-                print_timestamped("🔄 Возвращаюсь к основной логике заполнения данных...")
-                await send_telegram_message("Система требует обновления данных услуги. Переходим к заполнению...", is_verbose=False)
+                print_timestamped("🔄 Просто кликаю на кнопку 'Далі' для продолжения...")
+                await send_telegram_message("Система требует подтверждения данных услуги. Кликаю 'Далі'...", is_verbose=False)
                 
-                # Возвращаемся к основной функции для обработки
-                return await perform_consular_steps(page)
+                # Просто кликаем на кнопку "Далі" для продолжения
+                try:
+                    next_button_selector = '#next-step-button'
+                    await page.locator(next_button_selector).wait_for(state='visible', timeout=10000)
+                    print_timestamped("Кнопка 'Далі' найдена, кликаю...")
+                    
+                    async with page.expect_navigation(timeout=CONFIG['timeout']):
+                        await page.locator(next_button_selector).click(timeout=10000)
+                    
+                    await page.wait_for_load_state('networkidle', timeout=CONFIG['timeout'])
+                    print_timestamped(f"Успешно кликнул 'Далі' на странице consularServiceInfo. Переход на: {page.url}")
+                    await send_telegram_message("Успешно подтвердил данные услуги и перешел далее.", is_verbose=False)
+                    
+                    # Проверяем, что мы попали на нужную страницу
+                    if "dateAndTimeVisitInfo" in page.url:
+                        print_timestamped("✅ Успешно вернулись на страницу поиска слотов")
+                        continue  # Продолжаем основной цикл поиска слотов
+                    else:
+                        print_timestamped(f"⚠️ После клика попали на неожиданную страницу: {page.url}")
+                        # Даем еще одну попытку
+                        await page.wait_for_timeout(3000)
+                        continue
+                        
+                except Exception as e:
+                    print_timestamped(f"❌ Ошибка при клике на кнопку 'Далі': {e}")
+                    await send_telegram_message(f"Ошибка при подтверждении данных услуги: {e}", is_verbose=False)
+                    # Возвращаемся к полной обработке только в случае ошибки
+                    return await perform_consular_steps(page)
                     
             elif "id.e-consul.gov.ua" in current_url:
                 print_timestamped(f"🔐 Обнаружен редирект на авторизацию: {current_url}")
