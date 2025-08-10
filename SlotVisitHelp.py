@@ -13,7 +13,6 @@ import re
 import json # Добавлен импорт для работы с JSON
 import calendar # Импорт для генерации календаря
 import shutil # ИЗМЕНЕНИЕ: Добавлен для копирования файлов
-import base64 # НОВОЕ: Добавлен для работы с токенами авторизации
 # ИЗМЕНЕНИЕ: Добавлен импорт для работы с .env файлом
 from dotenv import load_dotenv
 
@@ -24,10 +23,6 @@ load_dotenv()
 # --- Класс для специального исключения при сбросе сессии ---
 class SessionResetException(Exception):
     """Исключение, вызываемое при сбросе сессии на сайте."""
-    pass
-
-class TokenRefreshException(Exception):
-    """Исключение при ошибке обновления токена авторизации."""
     pass
 
 # --- Глобальная переменная для текущего ID запроса ---
@@ -54,8 +49,8 @@ CONFIG = {
     'user_agent': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     'retry_count': 1,
     # ИЗМЕНЕНИЕ: Токен и ID чата теперь загружаются из файла .env
-    'telegram_bot_token': os.getenv('PROD_BOT_TOKEN'),
-    'telegram_chat_id': os.getenv('MY_TELEGRAM_ID'),
+    'telegram_bot_token': os.getenv('TELEGRAM_BOT_TOKEN'),
+    'telegram_chat_id': os.getenv('TELEGRAM_CHAT_ID'),
     'max_reload_attempts': 999999999,
     'reload_delay_seconds': 5,
     'post_search_delay_seconds': 3,
@@ -479,387 +474,6 @@ def extract_request_id_from_url(url):
         return match.group(1)
     return None
 
-# === НОВЫЕ ФУНКЦИИ ДЛЯ РАБОТЫ С ТОКЕНАМИ ===
-
-async def login_with_token(page):
-    """
-    Выполняет автоматическую авторизацию с использованием сохраненного refresh_token.
-    """
-    global USER_DATA
-    print_timestamped("Попытка входа с использованием сохраненного токена...")
-    await send_telegram_message("🔐 Обнаружена сохраненная сессия. Выполняю автоматический вход...", is_verbose=False)
-    
-    # 1. Обновляем access_token через API
-    try:
-        auth_header = f"Basic {base64.b64encode(f'{USER_DATA["client_id"]}:{USER_DATA["client_secret"]}'.encode()).decode()}"
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                USER_DATA['token_url'],
-                data={
-                    "grant_type": "refresh_token",
-                    "refresh_token": USER_DATA['refresh_token'],
-                    "client_id": USER_DATA['client_id'],
-                },
-                headers={'Authorization': auth_header}
-            )
-            response.raise_for_status()
-            new_tokens = response.json()
-            access_token = new_tokens['access_token']
-            
-            # Обновляем refresh_token, если он был возвращен
-            if 'refresh_token' in new_tokens:
-                USER_DATA['refresh_token'] = new_tokens['refresh_token']
-            
-            print_timestamped("✅ Успешно получен новый access_token.")
-            await send_telegram_message("🔑 Токен доступа успешно обновлен.", is_verbose=True)
-
-    except Exception as e:
-        print_timestamped(f"❌ Критическая ошибка: Не удалось обновить токен: {e}. Возможно, сессия истекла полностью.")
-        await send_telegram_message("❌ Не удалось обновить сессию. Похоже, она истекла. Пожалуйста, удалите папку 'user_data_archives' и запустите скрипт заново для входа через QR-код.", is_verbose=False)
-        raise TokenRefreshException(f"Не удалось обновить токен: {e}")
-
-    # 2. Внедряем токен в браузер
-    await page.goto(CONFIG['base_url'], wait_until='domcontentloaded')
-    await page.evaluate(f"localStorage.setItem('jwe-access-token-v2', '{access_token}')")
-    print_timestamped("🔧 Токен доступа внедрен в Local Storage.")
-    
-    # 3. Перезагружаем страницу и проверяем авторизацию
-    await page.goto(f"{CONFIG['base_url']}/messages", timeout=CONFIG['timeout'])
-    
-    is_logged_in = await check_session_validity(page)
-    if not is_logged_in:
-        raise SessionResetException("Не удалось авторизоваться с помощью внедренного токена.")
-        
-    await send_telegram_message("✅ Автоматическая авторизация по токену прошла успешно!", is_verbose=False)
-    print_timestamped("✅ Авторизация по токену успешна. Перехожу к следующим шагам.")
-    return True
-
-async def capture_tokens_and_login(page, auth_method):
-    """
-    Выполняет вход через QR-код и перехватывает токены для будущей автоматизации.
-    """
-    global USER_DATA
-    
-    token_captured = asyncio.Event()
-    
-    async def handle_token_request(route):
-        request = route.request
-        print_timestamped(f"🔍 ПЕРЕХВАЧЕН ЗАПРОС: {request.method} {request.url}")
-        
-        # Ищем запросы на получение токенов (OAuth)
-        if ("token" in request.url or 
-            "oauth" in request.url or 
-            "auth" in request.url or
-            "senduserdata" in request.url) and request.method == "POST":
-            print_timestamped(f"🎯 НАЙДЕН ЗАПРОС НА ТОКЕН/AUTH: {request.url}")
-            try:
-                # Извлекаем client_id и client_secret из заголовка Authorization
-                auth_header = request.headers.get('authorization', '')
-                print_timestamped(f"🔑 Authorization header: {auth_header[:50]}...")
-                
-                if auth_header.lower().startswith('basic '):
-                    decoded_header = base64.b64decode(auth_header[6:]).decode('utf-8')
-                    USER_DATA['client_id'], USER_DATA['client_secret'] = decoded_header.split(':', 1)
-                    print_timestamped(f"📋 Client ID: {USER_DATA['client_id']}")
-                
-                # Получаем тело запроса для анализа
-                post_data = request.post_data
-                if post_data:
-                    print_timestamped(f"📤 POST данные: {post_data[:200]}...")
-                
-                # Продолжаем выполнение запроса
-                response = await route.fetch()
-                
-                # Получаем ответ
-                try:
-                    response_body = await response.json()
-                    print_timestamped(f"📝 Ответ сервера: {list(response_body.keys())}")
-
-                    # Сохраняем токены
-                    if 'refresh_token' in response_body:
-                        USER_DATA['refresh_token'] = response_body['refresh_token']
-                        USER_DATA['token_url'] = request.url
-                        print_timestamped(f"🎉 УСПЕХ! refresh_token получен: {USER_DATA['refresh_token'][:20]}...")
-                        await send_telegram_message("🔐 Данные для автоматического входа успешно перехвачены!", is_verbose=True)
-                        token_captured.set()
-                    elif 'access_token' in response_body:
-                        USER_DATA['access_token'] = response_body['access_token']
-                        USER_DATA['token_url'] = request.url
-                        print_timestamped(f"🎉 УСПЕХ! access_token получен: {USER_DATA['access_token'][:20]}...")
-                        if 'refresh_token' not in USER_DATA:  # Если refresh еще не получен
-                            await send_telegram_message("🔐 Access token перехвачен, ожидаем refresh token...", is_verbose=True)
-                    else:
-                        print_timestamped(f"⚠️ Токены не найдены в ответе: {response_body}")
-                except:
-                    # Возможно это не JSON ответ
-                    response_text = await response.text()
-                    print_timestamped(f"📝 Ответ (текст): {response_text[:200]}...")
-                    
-                await route.fulfill(response=response)
-                        
-            except Exception as e:
-                print_timestamped(f"⚠️ Ошибка при обработке запроса на токен: {e}")
-                await route.continue_()
-        else:
-            await route.continue_()
-
-    # Устанавливаем перехватчик запросов для ВСЕХ запросов (отладка)
-    request_count = 0
-    
-    async def debug_all_requests(route):
-        nonlocal request_count
-        request_count += 1
-        request = route.request
-        print_timestamped(f"🌐 ЗАПРОС #{request_count}: {request.method} {request.url}")
-        await route.continue_()
-    
-    # Включаем отладку всех запросов
-    await page.route("**", debug_all_requests)
-    
-    # Устанавливаем специальный перехватчик для токенов ID.GOV.UA
-    await page.route("**/id.gov.ua/**", handle_token_request)
-    # Также проверяем запросы к банкам
-    await page.route("**/bank.gov.ua/**", handle_token_request)
-    
-    # Выполняем шаги авторизации в зависимости от метода
-    if auth_method == 'diia':
-        print_timestamped("🔵 Начинаю авторизацию через Дія.Підпис...")
-        await page.get_by_role("button", name="Дія.Підпис").click()
-        
-    elif auth_method == 'idgov':
-        print_timestamped("🟢 Начинаю авторизацию через ID.GOV.UA (BankID)...")
-        await page.locator('button').nth(2).click()
-        await page.wait_for_load_state('networkidle')
-        await page.get_by_text("Bank ID НБУ").click()
-        await page.wait_for_load_state('networkidle')
-        await page.locator('#selBankConnect-button').click()
-        await page.locator('#ui-id-4').click()  # monobank
-        await page.locator('#btnBankIDChoose').click()
-    
-    await page.wait_for_load_state('networkidle', timeout=CONFIG['timeout'])
-    
-    # Проверяем URL - если мы попали на API страницу банка, ищем QR-код
-    current_url = page.url
-    if "bankid-auth-request" in current_url or "api.monobank.ua" in current_url:
-        print_timestamped("🏦 Переход на API страницу банка обнаружен")
-        
-        # Сначала ищем QR-код на API странице
-        qr_found = False
-        qr_selectors = [
-            "canvas",
-            "img[src*='qr']", 
-            "img[alt*='QR']",
-            "img[alt*='qr']",
-            "[id*='qr']",
-            "[class*='qr']",
-            ".qr-code",
-            "#qr-code",
-            "div[data-qr]",
-            ".qr-container",
-            "#qr-overlay",
-            ".qr-overlay-container",
-            "iframe",  # QR может быть в iframe
-            ".bankid-qr",
-            "#bankid-qr",
-            "[data-testid*='qr']"
-        ]
-        
-        # Также проверяем все canvas элементы на предмет QR-кода
-        canvas_elements = await page.query_selector_all("canvas")
-        if canvas_elements:
-            print_timestamped(f"🔍 Найдено {len(canvas_elements)} canvas элементов, проверяем содержимое...")
-        
-        for selector in qr_selectors:
-            try:
-                if selector == "iframe":
-                    # Для iframe проверяем отдельно
-                    iframes = await page.query_selector_all("iframe")
-                    for iframe in iframes:
-                        try:
-                            frame = await iframe.content_frame()
-                            if frame:
-                                iframe_qr = await frame.query_selector("canvas")
-                                if iframe_qr and await iframe_qr.is_visible():
-                                    print_timestamped(f"✅ QR-код найден в iframe!")
-                                    qr_found = True
-                                    break
-                        except:
-                            continue
-                    if qr_found:
-                        break
-                else:
-                    qr_element = await page.query_selector(selector)
-                    if qr_element:
-                        # Проверяем видимость элемента
-                        is_visible = await qr_element.is_visible()
-                        if is_visible:
-                            print_timestamped(f"✅ QR-код найден с селектором: {selector}")
-                            qr_found = True
-                            break
-            except Exception as e:
-                continue
-        
-        if qr_found:
-            # Делаем скриншот с найденным QR-кодом
-            qr_path = await save_screenshot(page, f"{auth_method}_qr_found")
-            if qr_path:
-                await send_telegram_photo(qr_path, 
-                    "🎯 QR-код найден на странице банка!\n\n" +
-                    "📱 Отсканируйте QR-код мобильным приложением банка\n" +
-                    "⏳ Система автоматически перехватит токены после авторизации")
-        
-        if not qr_found:
-            # QR-код не найден сразу - ждем его появления
-            print_timestamped("🔍 QR-код не найден сразу, ожидаем его появления...")
-            
-            # Ждем появления QR-кода до 10 секунд
-            for wait_attempt in range(10):
-                await asyncio.sleep(1)
-                for selector in qr_selectors:
-                    try:
-                        qr_element = await page.query_selector(selector)
-                        if qr_element:
-                            is_visible = await qr_element.is_visible()
-                            if is_visible:
-                                print_timestamped(f"✅ QR-код появился! Селектор: {selector}")
-                                
-                                # Делаем скриншот с найденным QR-кодом
-                                qr_path = await save_screenshot(page, f"{auth_method}_qr_found")
-                                if qr_path:
-                                    await send_telegram_photo(qr_path, 
-                                        "🎯 QR-код найден на странице банка!\n\n" +
-                                        "📱 Отсканируйте QR-код мобильным приложением банка\n" +
-                                        "⏳ Система автоматически перехватит токены после авторизации")
-                                qr_found = True
-                                break
-                    except Exception as e:
-                        continue
-                
-                if qr_found:
-                    break
-            
-            if not qr_found:
-                # QR-код так и не найден - отправляем общую инструкцию
-                await send_telegram_message(
-                    "🏦 API страница банка найдена, но QR-код не обнаружен автоматически.\n\n"
-                    "📱 Найдите QR-код на странице и отсканируйте его мобильным приложением банка.\n\n"
-                    "🔔 После подтверждения в приложении система автоматически продолжит работу.\n\n"
-                    "⚡ Это нужно сделать только ОДИН раз! После этого вход будет полностью автоматическим.", 
-                    is_verbose=False
-                )
-                
-                # Делаем скриншот страницы для отладки
-                qr_path = await save_screenshot(page, f"{auth_method}_bank_api_page")
-                if qr_path:
-                    await send_telegram_photo(qr_path, "🔧 Страница API банка (найдите QR-код)")
-    
-    else:
-        # Ищем QR-код на обычной странице (если не API)
-        qr_selectors = [
-            "canvas",  # QR-код может быть в canvas
-            "div.qr-code", 
-            "#qr-overlay",
-            ".qr-overlay-container",
-            "img[src*='qr']",  # QR как изображение
-            ".qr-container",
-            "#qr-code",
-            "[class*='qr']",  # Любой элемент с классом содержащим 'qr'
-            "div[style*='qr']"  # Div со стилем содержащим 'qr'
-        ]
-        
-        qr_element = None
-        qr_path = None
-        
-        for selector in qr_selectors:
-            try:
-                print_timestamped(f"🔍 Ищу QR-код по селектору: {selector}")
-                qr_element = page.locator(selector).first
-                await qr_element.wait_for(state='visible', timeout=5000)  # Уменьшили таймаут
-                print_timestamped(f"✅ QR-код найден по селектору: {selector}")
-                qr_path = await save_screenshot(page, f"{auth_method}_qr_code", locator=qr_element)
-                break
-            except Exception as e:
-                print_timestamped(f"⚠️ Селектор {selector} не сработал: {str(e)[:100]}")
-                continue
-        
-        # Если QR не найден по селекторам, делаем скриншот всей страницы
-        if not qr_path:
-            print_timestamped("⚠️ QR-код не найден по селекторам, делаю скриншот всей страницы...")
-            qr_path = await save_screenshot(page, f"{auth_method}_full_page")
-    
-        if qr_path:
-            caption = f"📱 Отсканируйте QR-код для входа через {auth_method.upper()}.\n\n⚡ Это нужно сделать только ОДИН раз! После этого вход будет полностью автоматическим."
-            await send_telegram_photo(qr_path, caption)
-    
-        if qr_path:
-            caption = f"📱 Отсканируйте QR-код для входа через {auth_method.upper()}.\n\n⚡ Это нужно сделать только ОДИН раз! После этого вход будет полностью автоматическим."
-            await send_telegram_photo(qr_path, caption)
-    
-    print_timestamped("⏳ Ожидание входа пользователя и перехвата токена...")
-    
-    # Особая логика для idgov - может потребоваться нажать "Продовжити"
-    if auth_method == 'idgov':
-        try:
-            # Ожидаем либо переход на страницу подтверждения, либо прямо на e-consul
-            print_timestamped("🔄 Ожидание результата авторизации ID.GOV.UA...")
-            
-            # Ждем либо страницу подтверждения, либо основной сайт (что произойдет первым)
-            try:
-                await page.wait_for_url("**/id.gov.ua/bankid-auth-callback**", timeout=30000)
-                print_timestamped("✅ Попали на страницу подтверждения. Нажимаю 'Продовжити'...")
-                
-                # Нажимаем кнопку "Продовжити" на странице подтверждения
-                continue_button = page.locator('#btnAcceptUserDataAgreement')
-                await continue_button.wait_for(state='visible', timeout=30000)
-                await continue_button.click()
-                print_timestamped("🔘 Кнопка 'Продовжити' нажата.")
-                
-            except:
-                # Возможно, мы уже перешли на основной сайт или где-то еще
-                print_timestamped("🔄 Страница подтверждения не найдена, возможно авторизация прошла напрямую...")
-                
-        except Exception as e:
-            print_timestamped(f"⚠️ Ошибка при обработке страницы подтверждения ID.GOV.UA: {e}")
-    
-    try:
-        # Ждем 5 минут на полную авторизацию и перехват токена
-        await asyncio.wait_for(token_captured.wait(), timeout=300)
-        await send_telegram_message("✅ Сессия успешно сохранена! Больше QR-код сканировать не потребуется.", is_verbose=False)
-        print_timestamped("🎯 Токены сохранены. Авторизация будет продолжена.")
-        
-        # Отключаем перехватчики
-        await page.unroute("**", debug_all_requests)
-        await page.unroute("**/id.gov.ua/**", handle_token_request)
-        await page.unroute("**/bank.gov.ua/**", handle_token_request)
-        
-        # Ждем полного завершения редиректа на основной сайт
-        await page.wait_for_url(f"**{CONFIG['base_url']}/**", timeout=CONFIG['timeout'])
-        await page.wait_for_load_state('networkidle')
-        return True
-        
-    except asyncio.TimeoutError:
-        print_timestamped(f"⏰ Время ожидания токена истекло. Всего запросов перехвачено: {request_count}")
-        # Отключаем перехватчики
-        await page.unroute("**", debug_all_requests) 
-        await page.unroute("**/id.gov.ua/**", handle_token_request)
-        await page.unroute("**/bank.gov.ua/**", handle_token_request)
-        await send_telegram_message("⏰ Время ожидания входа истекло. Попробуйте снова.", is_verbose=False)
-        raise Exception("Пользователь не вошел в систему за 5 минут.")
-
-async def check_session_validity(page):
-    """Проверяет валидность сессии, ищет кнопку 'Запис на візит'."""
-    try:
-        if "id.e-consul.gov.ua" in page.url: 
-            return False
-        await page.get_by_role("link", name="Запис на візит").wait_for(state='visible', timeout=5000)
-        print_timestamped("✅ Сессия валидна (найден элемент 'Запис на візит').")
-        return True
-    except:
-        print_timestamped("❌ Сессия невалидна или таймаут при проверке.")
-        return False
-
-# === КОНЕЦ НОВЫХ ФУНКЦИЙ ===
-
 async def request_telegram_text(prompt_text, last_update_id, timeout_seconds=180):
     """
     Отправляет запрос в Telegram и ожидает текстовый ответ от пользователя.
@@ -985,29 +599,53 @@ async def perform_login_steps(page):
         USER_DATA['auth_method'] = auth_method
 
     if auth_method == 'diia':
-        print_timestamped("🔵 Выбран метод 'Дія.Підпис'. Начинаю авторизацию с перехватом токенов...")
         await send_telegram_message("Шаг 1: Выбран метод 'Дія.Підпис'. Начинаю авторизацию.", is_verbose=True)
         try:
-            # Используем новую функцию для перехвата токенов
-            await capture_tokens_and_login(page, 'diia')
-            print_timestamped("✅ Авторизация через 'Дія.Підпис' с перехватом токенов завершена успешно!")
-            await send_telegram_message("✅ Авторизация через 'Дія.Підпис' завершена. Токены сохранены!", is_verbose=False)
-            
+            diia_button_selector = 'button:has-text("Дія.Підпис")'
+            await page.locator(diia_button_selector).wait_for(state='visible', timeout=20000)
+            print_timestamped("Нажимаю кнопку 'Дія.Підпис'...")
+            await page.locator(diia_button_selector).click(timeout=30000)
+            print_timestamped("Ожидаю загрузки QR-кода на текущей странице...")
+            await page.wait_for_load_state('networkidle', timeout=CONFIG['timeout'])
+            print_timestamped(f"Страница с QR-кодом 'Дія' загружена. URL: {page.url}")
+            await send_telegram_message("Шаг 1.1 завершен: Переход на страницу с QR-кодом.", is_verbose=True)
+            print_timestamped("Шаг 1.2: Поиск и захват QR-кода 'Дія'...")
+            await page.wait_for_timeout(3000)
+            qr_element = page.locator("canvas, div.qr-code, #qr-overlay").first
+            await qr_element.wait_for(state='visible', timeout=60000)
+            print_timestamped("Элемент QR-кода найден и видим.")
+            await qr_element.scroll_into_view_if_needed()
+            await page.wait_for_timeout(1000)
+            qr_path = await save_screenshot(page, "diia_qr_code_capture", locator=qr_element, timeout=CONFIG['timeout'])
+            if qr_path:
+                await send_telegram_photo(qr_path, "Відскануйте QR-код у застосунку 'Дія' для авторизації.")
+                await send_telegram_message("QR-код для 'Дія' отправлен. Ожидаю подтверждения в приложении...", is_verbose=False)
+            else:
+                error_msg = "Не удалось создать скриншот QR-кода для 'Дія.Підпис'."
+                print_timestamped(error_msg)
+                await send_telegram_message(error_msg, is_verbose=False)
+                raise Exception(error_msg)
+            print_timestamped("Ожидание завершения авторизации через 'Дія'...")
+            await page.wait_for_url("**/e-consul.gov.ua/**", timeout=CONFIG['timeout'])
+            await page.wait_for_load_state('networkidle', timeout=CONFIG['timeout'])
+            print_timestamped(f"Авторизация через 'Дія.Підпис' успешно завершена. Текущий URL: {page.url}")
+            await page.context.storage_state(path=CONFIG['storage_state_path'])
+            print_timestamped(f"Состояние сессии сохранено после успешной авторизации в: {CONFIG['storage_state_path']}")
+            await send_telegram_message("Шаг 1.3 завершен: Успешная авторизация и сохранение сессии.", is_verbose=False)
         except Exception as e:
-            await send_telegram_message(f"❌ Критическая ошибка на Шаге 1 ('Дія.Підпис'): {e}", is_verbose=False)
+            await send_telegram_message(f"Критическая ошибка на Шаге 1 ('Дія.Підпис'): {e}", is_verbose=False)
             raise Exception(f"Ошибка на Шаге 1 ('Дія.Підпис'): {e}")
 
     elif auth_method == 'idgov':
-        print_timestamped("🟢 Выбран метод ID.GOV.UA. Начинаю авторизацию с перехватом токенов...")
         await send_telegram_message("Шаг 1: Выбран метод ID.GOV.UA. Начинаю авторизацию.", is_verbose=True)
         try:
-            # Используем новую функцию для перехвата токенов
-            await capture_tokens_and_login(page, 'idgov')
-            print_timestamped("✅ Авторизация через ID.GOV.UA с перехватом токенов завершена успешно!")
-            await send_telegram_message("✅ Авторизация через ID.GOV.UA завершена. Токены сохранены!", is_verbose=False)
-            
+            id_gov_ua_button = page.locator('button').nth(2)
+            await id_gov_ua_button.wait_for(state='visible', timeout=20000)
+            await id_gov_ua_button.click(timeout=30000)
+            await page.wait_for_load_state('networkidle', timeout=CONFIG['timeout'])
+            print_timestamped(f"Страница загружена после клика. Текущий URL: {page.url}")
+            await send_telegram_message("Шаг 1 завершен: Переход на ID.GOV.UA.", is_verbose=True)
         except Exception as e:
-            await send_telegram_message(f"❌ Критическая ошибка на Шаге 1 (ID.GOV.UA): {e}", is_verbose=False)
             raise Exception(f"Ошибка на Шаге 1 (ID.GOV.UA): {e}")
 
     elif auth_method == 'key':
@@ -2069,44 +1707,30 @@ async def try_access(browser, page):
         is_logged_in = await check_session_validity(page)
 
         if "id.e-consul.gov.ua" in current_url or not is_logged_in:
-            print_timestamped("Сессия неактивна или истекла. Проверяю наличие сохраненных токенов...")
-            
-            # === НОВАЯ ЛОГИКА: ПРОВЕРЯЕМ ТОКЕНЫ ===
-            if USER_DATA.get('refresh_token'):
-                print_timestamped("🔐 Найден сохраненный refresh_token. Выполняю автоматический вход...")
-                try:
-                    await login_with_token(page)
-                    print_timestamped("✅ Автоматическая авторизация по токену успешна!")
-                    return await perform_consular_steps(page)
-                except TokenRefreshException:
-                    print_timestamped("❌ Токен истек. Переход к обычной авторизации...")
-                    # Очищаем устаревшие токены
-                    USER_DATA.pop('refresh_token', None)
-                    USER_DATA.pop('client_id', None) 
-                    USER_DATA.pop('client_secret', None)
-                    USER_DATA.pop('token_url', None)
-                    
-            # === ОБЫЧНАЯ АВТОРИЗАЦИЯ ===
-            print_timestamped("🔑 Начинаю процедуру авторизации через QR-код...")
-            await send_telegram_message("Требуется авторизация! Подготавливаю QR-код...", is_verbose=False)
+            print_timestamped("Сессия неактивна или истекла. Начинаю авторизацию.")
+            await send_telegram_message("Требуется повторная авторизация!", is_verbose=False)
+            await send_telegram_message("Сессия неактивна. Начинаю авторизацию.", is_verbose=True)
 
             if os.path.exists(CONFIG['storage_state_path']):
                 try:
                     os.remove(CONFIG['storage_state_path'])
                     print_timestamped(f"Удален устаревший файл сессии: {CONFIG['storage_state_path']}")
+                    await send_telegram_message("Устаревший файл сессии удален. Повторная авторизация.", is_verbose=True)
                 except Exception as ex:
                     print_timestamped(f"Ошибка при удалении файла сессии {CONFIG['storage_state_path']}: {ex}")
 
             if "id.e-consul.gov.ua" not in page.url:
-                print_timestamped(f"Переходим на страницу авторизации...")
+                print_timestamped(f"Переходим на страницу авторизации: {CONFIG['base_url']}")
                 await page.goto(CONFIG['base_url'], timeout=CONFIG['timeout'], wait_until='load')
+                await send_telegram_message(f"Переход на {CONFIG['base_url']} для авторизации.", is_verbose=True)
                 try:
                     await page.wait_for_url("**/id.e-consul.gov.ua/**", timeout=30000)
                     print_timestamped(f"Перешли на страницу авторизации. URL: {page.url}")
+                    await send_telegram_message(f"Переход на страницу авторизации: {page.url}", is_verbose=True)
                 except PlaywrightTimeoutError:
                     raise Exception(f"Не удалось перейти на страницу авторизации после редиректа. Текущий URL: {page.url}")
 
-            print_timestamped("Выполняю шаги авторизации с перехватом токенов.")
+            print_timestamped("Выполняю шаги авторизации (1-5).")
             await perform_login_steps(page)
             return await perform_consular_steps(page)
         else:
@@ -2200,16 +1824,6 @@ async def main():
             print_timestamped(f"ШТАТНАЯ СИТУАЦИЯ: {e}. Перезапуск через 15 секунд.")
             await send_telegram_message(f"Сессия сброшена. Перезапуск через 15 секунд.", is_verbose=True)
             await asyncio.sleep(15)
-
-        except TokenRefreshException as e:
-            print_timestamped(f"ТОКЕН ИСТЕК: {e}. Очищаю токены и перезапускаю через 5 секунд.")
-            await send_telegram_message(f"🔐 Токены истекли. Потребуется повторная авторизация через QR-код.", is_verbose=False)
-            # Очищаем токены из USER_DATA
-            USER_DATA.pop('refresh_token', None)
-            USER_DATA.pop('client_id', None) 
-            USER_DATA.pop('client_secret', None)
-            USER_DATA.pop('token_url', None)
-            await asyncio.sleep(5)
 
         except Exception as e:
             print_timestamped(f"ФАТАЛЬНАЯ ОШИБКА: {e}. Перезапуск через 60 секунд.")
