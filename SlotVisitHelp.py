@@ -137,23 +137,30 @@ async def intercept_oauth_tokens(page, auth_method='unknown'):
                                 'timestamp': datetime.now().isoformat()
                             })
                             
-                            # Сохраняем токены глобально
-                            OAUTH_TOKENS.update({
-                                'access_token': token_data.get('access_token'),
-                                'refresh_token': token_data.get('refresh_token'),
-                                'expires_at': (datetime.now().timestamp() + 
-                                             token_data.get('expires_in', 3600)),
-                                'token_endpoint': response.url,
-                                'method': auth_method
-                            })
+                            # Проверяем, действительно ли токены изменились
+                            current_access_token = OAUTH_TOKENS.get('access_token')
+                            new_access_token = token_data.get('access_token')
                             
-                            await send_telegram_message(
-                                f"🔑 OAuth токены перехвачены! Метод: {auth_method}", 
-                                is_verbose=False
-                            )
-                            
-                            # Сохраняем токены в файл сразу после перехвата
-                            await save_oauth_tokens()
+                            if current_access_token != new_access_token:
+                                # Сохраняем токены глобально только если они изменились
+                                OAUTH_TOKENS.update({
+                                    'access_token': token_data.get('access_token'),
+                                    'refresh_token': token_data.get('refresh_token'),
+                                    'expires_at': (datetime.now().timestamp() + 
+                                                 token_data.get('expires_in', 3600)),
+                                    'token_endpoint': response.url,
+                                    'method': auth_method
+                                })
+                                
+                                await send_telegram_message(
+                                    f"🔑 OAuth токены перехвачены! Метод: {auth_method}", 
+                                    is_verbose=False
+                                )
+                                
+                                # Сохраняем токены в файл только если они изменились
+                                await save_oauth_tokens()
+                            else:
+                                print_timestamped(f"🔍 OAuth токены не изменились, пропускаю сохранение")
                             
                     except json.JSONDecodeError:
                         pass
@@ -293,6 +300,732 @@ async def extract_tokens_from_browser(page):
     except Exception as e:
         print_timestamped(f"❌ Ошибка извлечения токенов из браузера: {e}")
 
+async def refresh_jwt_token_via_session_restore(page=None):
+    """
+    Попытка обновить токен через восстановление браузерной сессии и перехват запросов
+    
+    Args:
+        page: объект страницы Playwright (если None, создаст новый браузер)
+    
+    Returns:
+        bool: успешность обновления
+    """
+    global OAUTH_TOKENS
+    
+    refresh_token = OAUTH_TOKENS.get('embedded_refresh_token')
+    if not refresh_token:
+        print_timestamped("❌ Нет embedded refresh token для обновления JWT")
+        return False
+    
+    print_timestamped("🔄 ОБНОВЛЕНИЕ ЧЕРЕЗ СЕССИОННОЕ ВОССТАНОВЛЕНИЕ - начинаю процесс...")
+    print_timestamped(f"🔑 Использую refresh token: {refresh_token[:20]}...")
+    
+    browser_created = False
+    network_requests = []
+    
+    try:
+        # Если страница не передана, создаем браузер с сохраненной сессией
+        if page is None:
+            from playwright.async_api import async_playwright
+            playwright = await async_playwright().start()
+            
+            # Пытаемся загрузить сохраненное состояние браузера
+            storage_state_path = CONFIG.get('storage_state_path')
+            storage_state = None
+            if storage_state_path and os.path.exists(storage_state_path):
+                print_timestamped(f"📁 Загружаю сохраненное состояние браузера из: {storage_state_path}")
+                with open(storage_state_path, 'r', encoding='utf-8') as f:
+                    storage_state = json.load(f)
+            
+            browser = await playwright.chromium.launch(
+                headless=False,  # Делаем браузер видимым для тестирования
+                channel="chrome",  # Используем настоящий Chrome
+                args=[
+                    "--start-maximized", 
+                    "--disable-blink-features=AutomationControlled",  # Ключевая настройка против детекции
+                    "--disable-web-security",
+                    "--disable-features=VizDisplayCompositor"
+                ],
+                timeout=60000
+            )
+            context = await browser.new_context(
+                locale="uk-UA",
+                user_agent=CONFIG['user_agent'],
+                timezone_id="Europe/Kiev",
+                storage_state=storage_state
+            )
+            page = await context.new_page()
+            browser_created = True
+        
+        # Убираем webdriver detection (важно для обхода Cloudflare)
+        await page.evaluate("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        
+        # Перехватываем сетевые запросы
+        def handle_request(request):
+            network_requests.append({
+                'url': request.url,
+                'method': request.method,
+                'headers': dict(request.headers)
+            })
+        
+        def handle_response(response):
+            if 'auth' in response.url or 'token' in response.url or 'refresh' in response.url:
+                print_timestamped(f"🌐 Перехвачен auth-ответ: {response.url} -> {response.status}")
+        
+        page.on('request', handle_request)
+        page.on('response', handle_response)
+        
+        # Переходим на сайт
+        print_timestamped("🌐 Открываю e-consul.gov.ua с сохраненной сессией...")
+        print_timestamped("👁️  Браузер должен быть видимым - наблюдайте за процессом!")
+        await page.goto("https://e-consul.gov.ua", timeout=30000)
+        print_timestamped("⏳ Жду загрузки страницы...")
+        await page.wait_for_load_state('networkidle')
+        print_timestamped("✅ Страница загружена")
+        
+        # Проверяем, авторизованы ли мы
+        is_logged_in = await page.evaluate("""
+            () => {
+                // Проверяем наличие токена в localStorage
+                var token = localStorage.getItem('token');
+                if (token) return { loggedIn: true, method: 'localStorage', token: token.substring(0, 20) + '...' };
+                
+                // Проверяем по элементам страницы
+                var loginButton = document.querySelector('button[class*="login"], a[href*="login"], .login-btn');
+                var userMenu = document.querySelector('.user-menu, .profile, [class*="user-"]');
+                
+                if (userMenu && !loginButton) {
+                    return { loggedIn: true, method: 'DOM_elements' };
+                }
+                
+                return { loggedIn: false };
+            }
+        """)
+        
+        print_timestamped(f"🔍 Статус авторизации: {is_logged_in}")
+        
+        if is_logged_in.get('loggedIn'):
+            print_timestamped("✅ Пользователь уже авторизован!")
+            
+            # Получаем текущий токен
+            current_token = await page.evaluate("() => localStorage.getItem('token')")
+            if current_token:
+                # Проверяем, отличается ли он от нашего сохраненного
+                if current_token != OAUTH_TOKENS.get('access_token'):
+                    print_timestamped("🔄 Найден обновленный токен в браузере!")
+                    print_timestamped(f"   Старый: {OAUTH_TOKENS.get('access_token', '')[:20]}...")
+                    print_timestamped(f"   Новый: {current_token[:20]}...")
+                    
+                    # Обновляем наш токен
+                    OAUTH_TOKENS['access_token'] = current_token
+                    OAUTH_TOKENS['method'] = 'session_restore_renewal'
+                    OAUTH_TOKENS['last_refresh'] = datetime.now().isoformat()
+                    
+                    await send_telegram_message("🔄 ✅ Токен обновлен через восстановление сессии!", is_verbose=False)
+                    await save_oauth_tokens()
+                    return True
+                else:
+                    print_timestamped("ℹ️  Токен в браузере совпадает с сохраненным")
+            
+            return True
+        else:
+            print_timestamped("❌ Пользователь не авторизован в восстановленной сессии")
+            
+            # Попробуем принудительно инжектировать токены и обновить
+            print_timestamped("💉 Инжектирую токены и пытаюсь восстановить сессию...")
+            
+            await page.evaluate(f"""
+                () => {{
+                    localStorage.setItem('token', '{OAUTH_TOKENS.get("access_token", "")}');
+                    localStorage.setItem('refresh_token', '{refresh_token}');
+                    
+                    // Попробуем запустить обновление токена если есть функции
+                    if (window.location.reload) {{
+                        console.log('🔄 Перезагружаю страницу с инжектированными токенами...');
+                        setTimeout(() => window.location.reload(), 1000);
+                    }}
+                }}
+            """)
+            
+            # Ждем перезагрузки
+            print_timestamped("⏳ Жду перезагрузки страницы (5 секунд)...")
+            await page.wait_for_timeout(5000)  # Увеличиваем время ожидания
+            await page.wait_for_load_state('networkidle')
+            
+            # Проверяем еще раз
+            print_timestamped("🔍 Финальная проверка состояния...")
+            final_check = await page.evaluate("() => ({ token: localStorage.getItem('token'), url: window.location.href })")
+            print_timestamped(f"🔍 Финальная проверка: {final_check}")
+            
+            print_timestamped("⏳ Пауза 3 секунды перед закрытием браузера...")
+            await page.wait_for_timeout(3000)  # Пауза перед закрытием
+            
+            return False
+                
+    except Exception as e:
+        print_timestamped(f"❌ Исключение при обновлении через сессию: {e}")
+        return False
+    finally:
+        # Выводим перехваченные запросы
+        if network_requests:
+            auth_requests = [req for req in network_requests if any(keyword in req['url'].lower() for keyword in ['auth', 'token', 'refresh', 'login'])]
+            if auth_requests:
+                print_timestamped("🌐 Перехваченные auth-запросы:")
+                for req in auth_requests[-5:]:  # Последние 5
+                    print_timestamped(f"   {req['method']} {req['url']}")
+        
+        # Закрываем временный браузер если создавали
+        if browser_created:
+            try:
+                await browser.close()
+                await playwright.stop()
+            except:
+                pass
+
+async def refresh_jwt_token_browser(page=None):
+    """
+    Обновляет JWT токен через браузер используя embedded refresh token
+    
+    Args:
+        page: объект страницы Playwright (если None, создаст новый браузер)
+    
+    Returns:
+        bool: успешность обновления
+    """
+    global OAUTH_TOKENS
+    
+    refresh_token = OAUTH_TOKENS.get('embedded_refresh_token')
+    if not refresh_token:
+        print_timestamped("❌ Нет embedded refresh token для обновления JWT")
+        return False
+    
+    print_timestamped("🔄 ОБНОВЛЕНИЕ ЧЕРЕЗ REFRESH TOKEN В БРАУЗЕРЕ - начинаю процесс...")
+    print_timestamped(f"🔑 Использую refresh token: {refresh_token[:20]}...")
+    
+    browser_created = False
+    try:
+        # Если страница не передана, создаем временный браузер
+        if page is None:
+            from playwright.async_api import async_playwright
+            playwright = await async_playwright().start()
+            browser = await playwright.chromium.launch(
+                headless=False,  # Делаем браузер видимым для тестирования
+                channel="chrome",  # Используем настоящий Chrome
+                args=[
+                    "--start-maximized", 
+                    "--disable-blink-features=AutomationControlled",  # Ключевая настройка против детекции
+                    "--disable-web-security",
+                    "--disable-features=VizDisplayCompositor"
+                ],
+                timeout=60000
+            )
+            context = await browser.new_context(
+                locale="uk-UA",
+                user_agent=CONFIG['user_agent'],
+                timezone_id="Europe/Kiev"
+            )
+            page = await context.new_page()
+            browser_created = True
+        
+        # Убираем webdriver detection (важно для обхода Cloudflare)
+        await page.evaluate("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        
+        # Переходим на сайт
+        print_timestamped("🌐 Открываю e-consul.gov.ua...")
+        print_timestamped("👁️  Браузер должен быть видимым - наблюдайте за процессом!")
+        await page.goto("https://e-consul.gov.ua", timeout=30000)
+        print_timestamped("⏳ Жду загрузки страницы...")
+        await page.wait_for_load_state('networkidle')
+        print_timestamped("✅ Страница загружена")
+        
+        # Получаем логи консоли браузера
+        console_logs = []
+        def handle_console(msg):
+            console_logs.append(f"CONSOLE: {msg.text}")
+        
+        page.on('console', handle_console)
+        
+        # Инжектируем refresh token и пытаемся обновить через JavaScript
+        print_timestamped("💉 Инжектирую refresh token в браузер...")
+        
+        # Сначала проверим, что есть в localStorage
+        current_storage = await page.evaluate("""
+            () => {
+                var storage = {};
+                for (var i = 0; i < localStorage.length; i++) {
+                    var key = localStorage.key(i);
+                    storage[key] = localStorage.getItem(key);
+                }
+                return {
+                    localStorage: storage,
+                    cookies: document.cookie,
+                    domain: window.location.hostname
+                };
+            }
+        """)
+        
+        print_timestamped(f"🔍 Текущее состояние браузера: {current_storage}")
+        
+        # Проверим, есть ли уже токен в браузере
+        existing_token = await page.evaluate("() => localStorage.getItem('token')")
+        if existing_token:
+            print_timestamped(f"🔑 Найден существующий токен: {existing_token[:20]}...")
+        else:
+            print_timestamped("❌ Токен в localStorage не найден")
+            
+        # Инжектируем наш токен для тестирования
+        await page.evaluate(f"localStorage.setItem('token', '{OAUTH_TOKENS['access_token']}')")
+        print_timestamped("💾 Инжектировал текущий токен в localStorage")
+        
+        # Пробуем разные способы обновления токена через браузер
+        refresh_script = f"""
+        (async function() {{
+            var refreshToken = '{refresh_token}';
+            console.log('🔄 Начинаю обновление токена через браузер...');
+            
+            // Пробуем разные endpoints и методы
+            var endpoints = [
+                '/api/auth/refresh',
+                '/api/v1/auth/refresh', 
+                '/auth/refresh',
+                '/oauth/token'
+            ];
+            
+            for (var i = 0; i < endpoints.length; i++) {{
+                var endpoint = endpoints[i];
+                try {{
+                    console.log('🌐 Пробую endpoint:', endpoint);
+                    
+                    // JSON формат
+                    try {{
+                        var response1 = await fetch(endpoint, {{
+                            method: 'POST',
+                            headers: {{
+                                'Content-Type': 'application/json',
+                                'Accept': 'application/json'
+                            }},
+                            body: JSON.stringify({{ refreshToken: refreshToken }})
+                        }});
+                        
+                        if (response1.ok) {{
+                            var data1 = await response1.json();
+                            console.log('✅ Успешный ответ (JSON):', data1);
+                            return {{ success: true, endpoint: endpoint, method: 'json', data: data1 }};
+                        }} else {{
+                            console.log('❌ JSON ошибка:', response1.status);
+                        }}
+                    }} catch (e1) {{
+                        console.log('❌ JSON исключение:', e1.message);
+                    }}
+                    
+                    // Form data формат
+                    try {{
+                        var response2 = await fetch(endpoint, {{
+                            method: 'POST',
+                            headers: {{
+                                'Content-Type': 'application/x-www-form-urlencoded',
+                                'Accept': 'application/json'
+                            }},
+                            body: 'refresh_token=' + encodeURIComponent(refreshToken) + '&grant_type=refresh_token'
+                        }});
+                        
+                        if (response2.ok) {{
+                            var data2 = await response2.json();
+                            console.log('✅ Успешный ответ (Form):', data2);
+                            return {{ success: true, endpoint: endpoint, method: 'form', data: data2 }};
+                        }} else {{
+                            console.log('❌ Form ошибка:', response2.status);
+                        }}
+                    }} catch (e2) {{
+                        console.log('❌ Form исключение:', e2.message);
+                    }}
+                    
+                }} catch (error) {{
+                    console.log('❌ Общее исключение для', endpoint, ':', error.message);
+                }}
+            }}
+            
+            // Если API не сработало, пробуем через localStorage/sessionStorage
+            console.log('🔄 Пробую обновление через localStorage...');
+            try {{
+                // Сохраняем старый токен для сравнения
+                var oldToken = localStorage.getItem('token') || localStorage.getItem('access_token');
+                localStorage.setItem('old_token', oldToken);
+                
+                // Сохраняем refresh token в localStorage
+                localStorage.setItem('refresh_token', refreshToken);
+                
+                // Пробуем найти функции обновления в глобальной области
+                if (typeof window.refreshAuthToken === 'function') {{
+                    var result1 = await window.refreshAuthToken();
+                    return {{ success: true, method: 'global_function', data: result1 }};
+                }}
+                
+                if (window.auth && typeof window.auth.refresh === 'function') {{
+                    var result2 = await window.auth.refresh(refreshToken);
+                    return {{ success: true, method: 'auth_object', data: result2 }};
+                }}
+                
+                // Проверяем, изменились ли токены в localStorage
+                var newToken = localStorage.getItem('token') || localStorage.getItem('access_token');
+                if (newToken && newToken !== oldToken) {{
+                    return {{ success: true, method: 'localStorage_change', data: {{ token: newToken }} }};
+                }}
+                
+                // Пробуем симулировать обновление токена
+                console.log('🔄 Пробую симулировать refresh...');
+                
+                // Создаем скрытый iframe для выполнения refresh запроса
+                var iframe = document.createElement('iframe');
+                iframe.style.display = 'none';
+                iframe.src = '/api/auth/refresh?refreshToken=' + encodeURIComponent(refreshToken);
+                document.body.appendChild(iframe);
+                
+                // Ждем немного и проверяем результат
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                
+                var finalToken = localStorage.getItem('token') || localStorage.getItem('access_token');
+                if (finalToken && finalToken !== oldToken) {{
+                    document.body.removeChild(iframe);
+                    return {{ success: true, method: 'iframe_refresh', data: {{ token: finalToken }} }};
+                }}
+                
+                document.body.removeChild(iframe);
+                
+            }} catch (error) {{
+                console.log('❌ Ошибка localStorage:', error.message);
+            }}
+            
+            return {{ success: false, error: 'No working method found' }};
+        }})();
+        """
+        
+        print_timestamped("🔄 Выполняю JavaScript для обновления токена...")
+        print_timestamped("⏳ Ожидание 5 секунд для наблюдения...")
+        await page.wait_for_timeout(5000)  # Пауза для наблюдения
+        result = await page.evaluate(refresh_script)
+        
+        print_timestamped(f"📊 Результат JavaScript: {result}")
+        
+        # Выводим логи консоли браузера
+        if console_logs:
+            print_timestamped("📝 Логи консоли браузера:")
+            for log in console_logs[-10:]:  # Последние 10 записей
+                print_timestamped(f"   {log}")
+        
+        # Проверим, изменился ли токен в localStorage
+        print_timestamped("🔍 Проверяю изменения в localStorage...")
+        final_token = await page.evaluate("() => localStorage.getItem('token')")
+        if final_token and final_token != OAUTH_TOKENS['access_token']:
+            print_timestamped(f"🔄 Токен в localStorage изменился!")
+            print_timestamped(f"   Старый: {OAUTH_TOKENS['access_token'][:20]}...")
+            print_timestamped(f"   Новый: {final_token[:20]}...")
+            
+            # Обновляем результат
+            result = {
+                'success': True,
+                'method': 'localStorage_detection',
+                'data': {'token': final_token}
+            }
+        
+        print_timestamped("⏳ Пауза 3 секунды перед закрытием браузера...")
+        await page.wait_for_timeout(3000)  # Пауза перед закрытием
+        
+        if result.get('success'):
+            print_timestamped("✅ УСПЕШНО! Токен обновлен через браузер")
+            print_timestamped(f"🎯 Метод: {result.get('method', result.get('endpoint', 'unknown'))}")
+            
+            new_token_data = result.get('data', {})
+            new_token = new_token_data.get('token') or new_token_data.get('access_token')
+            
+            if new_token:
+                print_timestamped(f"🔑 Получен новый токен: {new_token[:20]}...")
+                
+                OAUTH_TOKENS['access_token'] = new_token
+                OAUTH_TOKENS['method'] = 'refresh_token_renewal_browser'
+                OAUTH_TOKENS['last_refresh'] = datetime.now().isoformat()
+                OAUTH_TOKENS['refresh_method'] = result.get('method', result.get('endpoint', 'unknown'))
+                
+                # Анализируем новый JWT токен
+                try:
+                    import base64
+                    payload = new_token.split('.')[1]
+                    payload += '=' * (4 - len(payload) % 4)
+                    decoded = base64.b64decode(payload)
+                    jwt_data = json.loads(decoded)
+                    
+                    exp_time = jwt_data.get('exp')
+                    if exp_time:
+                        exp_datetime = datetime.fromtimestamp(exp_time)
+                        remaining_hours = (exp_time - datetime.now().timestamp()) / 3600
+                        print_timestamped(f"🕐 Новый токен действует до: {exp_datetime}")
+                        print_timestamped(f"⏱️  Продолжительность: {remaining_hours:.1f} часов")
+                        
+                        # Обновляем embedded refresh token если есть
+                        if 'authTokens' in jwt_data and 'refreshToken' in jwt_data['authTokens']:
+                            OAUTH_TOKENS['embedded_refresh_token'] = jwt_data['authTokens']['refreshToken']
+                            print_timestamped("🔄 Обновлен embedded refresh token")
+                
+                except Exception as e:
+                    print_timestamped(f"⚠️  Ошибка анализа нового JWT: {e}")
+                
+                await send_telegram_message("🔄 ✅ Токен обновлен через БРАУЗЕР с Refresh Token!", is_verbose=False)
+                await save_oauth_tokens()
+                return True
+            else:
+                print_timestamped("❌ Новый токен не найден в ответе")
+                return False
+        else:
+            print_timestamped(f"❌ Не удалось обновить токен: {result.get('error', 'Unknown error')}")
+            return False
+                
+    except Exception as e:
+        print_timestamped(f"❌ Исключение при обновлении JWT через браузер: {e}")
+        return False
+    finally:
+        # Закрываем временный браузер если создавали
+        if browser_created:
+            try:
+                await browser.close()
+                await playwright.stop()
+            except:
+                pass
+
+async def refresh_jwt_token_with_auth_headers():
+    """
+    Обновляет JWT токен через API с правильными заголовками аутентификации
+    
+    Returns:
+        bool: успешность обновления
+    """
+    global OAUTH_TOKENS
+    
+    refresh_token = OAUTH_TOKENS.get('embedded_refresh_token')
+    if not refresh_token:
+        return False
+    
+    try:
+        import httpx
+        
+        # Используем текущий токен для аутентификации запроса refresh
+        current_token = OAUTH_TOKENS.get('access_token')
+        
+        # Правильные заголовки как от настоящего браузера
+        headers = {
+            'Authorization': f'Bearer {current_token}',
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'User-Agent': CONFIG['user_agent'],
+            'Origin': 'https://e-consul.gov.ua',
+            'Referer': 'https://e-consul.gov.ua/',
+            'X-Requested-With': 'XMLHttpRequest'
+        }
+        
+        # Пробуем реальные endpoints, которые может использовать сайт
+        endpoints = [
+            "https://my.e-consul.gov.ua/api/auth/refresh",
+            "https://e-consul.gov.ua/api/auth/refresh", 
+            "https://id.e-consul.gov.ua/api/auth/refresh"
+        ]
+        
+        for endpoint in endpoints:
+            try:
+                print_timestamped(f"🌐 Пробую authenticated refresh: {endpoint}")
+                
+                async with httpx.AsyncClient() as client:
+                    response = await client.post(
+                        endpoint,
+                        json={'refreshToken': refresh_token},
+                        headers=headers,
+                        timeout=15
+                    )
+                    
+                    print_timestamped(f"📡 Ответ: {response.status_code}")
+                    
+                    if response.status_code == 200:
+                        new_token_data = response.json()
+                        
+                        if 'token' in new_token_data or 'access_token' in new_token_data:
+                            new_token = new_token_data.get('token') or new_token_data.get('access_token')
+                            
+                            print_timestamped("✅ УСПЕШНО! Токен обновлен через API с аутентификацией")
+                            
+                            OAUTH_TOKENS['access_token'] = new_token
+                            OAUTH_TOKENS['method'] = 'api_authenticated_refresh'
+                            OAUTH_TOKENS['last_refresh'] = datetime.now().isoformat()
+                            
+                            # Обновляем embedded refresh token если есть
+                            if 'refreshToken' in new_token_data:
+                                OAUTH_TOKENS['embedded_refresh_token'] = new_token_data['refreshToken']
+                            
+                            await send_telegram_message("🔄 ✅ Токен обновлен через API!", is_verbose=False)
+                            await save_oauth_tokens()
+                            
+                            return True
+                    elif response.status_code == 401:
+                        print_timestamped("⚠️  401 - токен недействителен для этого endpoint")
+                    elif response.status_code == 404:
+                        print_timestamped("⚠️  404 - endpoint не существует")
+                    else:
+                        print_timestamped(f"⚠️  {response.status_code} - неожиданный ответ")
+                        
+            except Exception as e:
+                print_timestamped(f"❌ Ошибка {endpoint}: {e}")
+        
+        return False
+                
+    except Exception as e:
+        print_timestamped(f"❌ Исключение в API refresh: {e}")
+        return False
+
+async def refresh_jwt_token():
+    """
+    Обновляет JWT токен используя embedded refresh token
+    Пробует разные методы: сессионное восстановление, браузер, API
+    
+    Returns:
+        bool: успешность обновления
+    """
+    global OAUTH_TOKENS
+    
+    refresh_token = OAUTH_TOKENS.get('embedded_refresh_token')
+    if not refresh_token:
+        print_timestamped("❌ Нет embedded refresh token для обновления JWT")
+        return False
+    
+    print_timestamped("🔄 АВТОМАТИЧЕСКОЕ ОБНОВЛЕНИЕ ЧЕРЕЗ REFRESH TOKEN - начинаю процесс...")
+    print_timestamped(f"🔑 Использую refresh token: {refresh_token[:20]}...")
+    
+    # В реальном сценарии (не тестирование) пробуем более мягкие методы
+    
+    # 1. Сначала пробуем простое обновление через API с реальными заголовками
+    print_timestamped("🔄 Метод 1: API обновление с аутентифицированными заголовками...")
+    api_result = await refresh_jwt_token_with_auth_headers()
+    
+    if api_result:
+        return True
+    
+    # 2. Потом пробуем через восстановление сессии
+    print_timestamped("🔄 Метод 2: Восстановление браузерной сессии...")
+    session_result = await refresh_jwt_token_via_session_restore()
+    
+    if session_result:
+        return True
+    
+    # 3. В крайнем случае - прямое браузерное обновление
+    print_timestamped("🔄 Метод 3: Прямое браузерное обновление...")
+    browser_result = await refresh_jwt_token_browser()
+    
+    if browser_result:
+        return True
+    
+    print_timestamped("⚠️  Все методы автоматического обновления не сработали")
+    print_timestamped("💡 Это может быть нормально - возможно требуется повторная авторизация")
+    
+    try:
+        import httpx
+        
+        # Попробуем разные endpoints для обновления токенов
+        endpoints = [
+            "https://e-consul.gov.ua/api/auth/refresh",
+            "https://e-consul.gov.ua/api/v1/auth/refresh", 
+            "https://e-consul.gov.ua/auth/refresh",
+            "https://e-consul.gov.ua/oauth/token"
+        ]
+        
+        for endpoint in endpoints:
+            print_timestamped(f"🌐 Пробую endpoint: {endpoint}")
+            
+            # Пробуем разные форматы данных
+            formats = [
+                {'refreshToken': refresh_token},  # JSON формат
+                {'refresh_token': refresh_token, 'grant_type': 'refresh_token'},  # OAuth стандарт
+                {'token': refresh_token, 'type': 'refresh'}  # Альтернативный формат
+            ]
+            
+            headers_variants = [
+                {
+                    'Content-Type': 'application/json',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Accept': 'application/json'
+                },
+                {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Accept': 'application/json'
+                }
+            ]
+            
+            for token_data in formats:
+                for headers in headers_variants:
+                    try:
+                        async with httpx.AsyncClient() as client:
+                            if headers['Content-Type'] == 'application/json':
+                                response = await client.post(endpoint, json=token_data, headers=headers, timeout=10)
+                            else:
+                                response = await client.post(endpoint, data=token_data, headers=headers, timeout=10)
+                            
+                            print_timestamped(f"📡 {endpoint} - Status: {response.status_code}")
+                            
+                            if response.status_code == 200:
+                                new_token_data = response.json()
+                                print_timestamped("✅ УСПЕШНО! Найден рабочий endpoint и формат")
+                                print_timestamped(f"🎯 Endpoint: {endpoint}")
+                                print_timestamped(f"📝 Format: {token_data}")
+                                print_timestamped(f"🔧 Headers: {headers['Content-Type']}")
+                                
+                                if 'token' in new_token_data or 'access_token' in new_token_data:
+                                    new_token = new_token_data.get('token') or new_token_data.get('access_token')
+                                    
+                                    OAUTH_TOKENS['access_token'] = new_token
+                                    OAUTH_TOKENS['method'] = 'refresh_token_renewal'
+                                    OAUTH_TOKENS['last_refresh'] = datetime.now().isoformat()
+                                    OAUTH_TOKENS['working_endpoint'] = endpoint
+                                    
+                                    # Анализируем новый JWT токен
+                                    try:
+                                        import base64
+                                        payload = new_token.split('.')[1]
+                                        payload += '=' * (4 - len(payload) % 4)
+                                        decoded = base64.b64decode(payload)
+                                        jwt_data = json.loads(decoded)
+                                        
+                                        exp_time = jwt_data.get('exp')
+                                        if exp_time:
+                                            exp_datetime = datetime.fromtimestamp(exp_time)
+                                            remaining_hours = (exp_time - datetime.now().timestamp()) / 3600
+                                            print_timestamped(f"🕐 Новый токен действует до: {exp_datetime}")
+                                            print_timestamped(f"⏱️  Продолжительность: {remaining_hours:.1f} часов")
+                                            
+                                            # Обновляем embedded refresh token если есть
+                                            if 'authTokens' in jwt_data and 'refreshToken' in jwt_data['authTokens']:
+                                                OAUTH_TOKENS['embedded_refresh_token'] = jwt_data['authTokens']['refreshToken']
+                                                print_timestamped("🔄 Обновлен embedded refresh token")
+                                    
+                                    except Exception as e:
+                                        print_timestamped(f"⚠️  Ошибка анализа нового JWT: {e}")
+                                    
+                                    await send_telegram_message("🔄 ✅ Токен обновлен через REFRESH TOKEN!", is_verbose=False)
+                                    await save_oauth_tokens()
+                                    return True
+                                else:
+                                    print_timestamped("❌ Сервер не вернул новый токен")
+                            elif response.status_code != 404:  # Логируем все кроме 404
+                                error_text = response.text[:100] if hasattr(response, 'text') else "No response text"
+                                print_timestamped(f"⚠️  {response.status_code}: {error_text}")
+                    
+                    except httpx.TimeoutException:
+                        print_timestamped(f"⏰ Timeout для {endpoint}")
+                    except Exception as e:
+                        print_timestamped(f"❌ Ошибка запроса к {endpoint}: {e}")
+        
+        print_timestamped("❌ Ни один endpoint не сработал для refresh token")
+        return False
+                
+    except Exception as e:
+        print_timestamped(f"❌ Исключение при обновлении JWT: {e}")
+        return False
+
 async def refresh_oauth_token():
     """
     Обновляет access_token используя refresh_token
@@ -361,6 +1094,69 @@ async def refresh_oauth_token():
         print_timestamped(f"❌ Исключение при обновлении токена: {e}")
         return False
 
+"""
+Вспомогательные функции аудита ротации токенов располагаем выше save_oauth_tokens,
+чтобы они были доступны статическому анализу и вызовам.
+"""
+
+def _token_fingerprint(token: str) -> str:
+    try:
+        import hashlib
+        if not token:
+            return "<none>"
+        h = hashlib.sha256(token.encode('utf-8')).hexdigest()
+        return f"sha256:{h[:10]}"
+    except Exception:
+        return (token[:6] + "…" + token[-4:]) if token and len(token) > 12 else token or "<none>"
+
+def _append_refresh_audit(prev_tokens: dict, new_tokens: dict, reason: str = "save"):
+    try:
+        os.makedirs(CONFIG['base_keys_dir'], exist_ok=True)
+        log_path = os.path.join(CONFIG['base_keys_dir'], 'refresh_audit.jsonl')
+
+        prev_access = (prev_tokens or {}).get('access_token')
+        prev_refresh = (prev_tokens or {}).get('embedded_refresh_token') or (prev_tokens or {}).get('refresh_token')
+        new_access = (new_tokens or {}).get('access_token')
+        new_refresh = (new_tokens or {}).get('embedded_refresh_token') or (new_tokens or {}).get('refresh_token')
+
+        # Более строгая проверка изменений - токены должны реально отличаться
+        access_changed = False
+        refresh_changed = False
+        
+        if prev_access and new_access and prev_access != new_access:
+            access_changed = True
+        elif not prev_access and new_access:
+            # Первоначальное получение токена (не считаем ротацией)
+            access_changed = False
+        
+        if prev_refresh and new_refresh and prev_refresh != new_refresh:
+            refresh_changed = True
+        elif not prev_refresh and new_refresh:
+            # Первоначальное получение refresh токена (не считаем ротацией)
+            refresh_changed = False
+
+        # Логируем только если есть реальные изменения
+        if access_changed or refresh_changed:
+            record = {
+                'ts': datetime.now().isoformat(),
+                'reason': reason,
+                'method': new_tokens.get('method'),
+                'access_changed': access_changed,
+                'refresh_changed': refresh_changed,
+                'access_fp_old': _token_fingerprint(prev_access),
+                'access_fp_new': _token_fingerprint(new_access),
+                'refresh_fp_old': _token_fingerprint(prev_refresh),
+                'refresh_fp_new': _token_fingerprint(new_refresh),
+            }
+            with open(log_path, 'a', encoding='utf-8') as lf:
+                lf.write(json.dumps(record, ensure_ascii=False) + "\n")
+            if access_changed:
+                print_timestamped(f"🔁 Access token обновился: {record['access_fp_old']} → {record['access_fp_new']}")
+            if refresh_changed:
+                print_timestamped(f"🔁 Refresh token обновился: {record['refresh_fp_old']} → {record['refresh_fp_new']}")
+    except Exception as e:
+        print_timestamped(f"⚠️  Не удалось записать аудит ротации токенов: {e}")
+
 async def save_oauth_tokens():
     """Сохраняет OAuth токены в файл"""
     global OAUTH_TOKENS
@@ -371,9 +1167,20 @@ async def save_oauth_tokens():
     try:
         # Используем фиксированное имя файла, не привязанное к process_id
         tokens_file = os.path.join(CONFIG['base_keys_dir'], "oauth_tokens.json")
+        # Прочтем прошлое состояние для аудита
+        previous = {}
+        if os.path.exists(tokens_file):
+            try:
+                with open(tokens_file, 'r', encoding='utf-8') as pf:
+                    previous = json.load(pf)
+            except Exception:
+                previous = {}
         
         # Убираем None значения перед сохранением
         clean_tokens = {k: v for k, v in OAUTH_TOKENS.items() if v is not None}
+        
+        # Аудит ротации перед записью
+        _append_refresh_audit(previous, clean_tokens, reason="save")
         
         with open(tokens_file, 'w', encoding='utf-8') as f:
             json.dump(clean_tokens, f, indent=2, ensure_ascii=False)
@@ -398,14 +1205,48 @@ async def load_oauth_tokens():
             OAUTH_TOKENS.update(saved_tokens)
             print_timestamped(f"📁 OAuth токены загружены из: {tokens_file}")
             
-            # Проверяем срок действия
-            if OAUTH_TOKENS.get('expires_at'):
-                if datetime.now().timestamp() < OAUTH_TOKENS['expires_at']:
-                    print_timestamped("✅ OAuth токен еще действителен")
-                    return True
-                else:
-                    print_timestamped("⏰ OAuth токен истек, попробую обновить...")
-                    return await refresh_oauth_token()
+            # Проверяем тип токена и его срок действия
+            if OAUTH_TOKENS.get('access_token'):
+                # Проверяем, JWT ли это токен
+                if OAUTH_TOKENS['access_token'].count('.') == 2:
+                    print_timestamped("🔍 Обнаружен JWT токен, анализирую...")
+                    try:
+                        import base64
+                        payload = OAUTH_TOKENS['access_token'].split('.')[1]
+                        payload += '=' * (4 - len(payload) % 4)
+                        decoded = base64.b64decode(payload)
+                        jwt_data = json.loads(decoded)
+                        
+                        exp_time = jwt_data.get('exp')
+                        if exp_time:
+                            exp_datetime = datetime.fromtimestamp(exp_time)
+                            remaining_hours = (exp_time - datetime.now().timestamp()) / 3600
+                            
+                            if remaining_hours > 0:
+                                print_timestamped(f"✅ JWT токен действителен до: {exp_datetime}")
+                                print_timestamped(f"⏱️  Осталось: {remaining_hours:.1f} часов")
+                                
+                                # Проверяем наличие refresh token внутри JWT
+                                if 'authTokens' in jwt_data and 'refreshToken' in jwt_data['authTokens']:
+                                    print_timestamped("🔄 Refresh Token найден в JWT структуре")
+                                    OAUTH_TOKENS['embedded_refresh_token'] = jwt_data['authTokens']['refreshToken']
+                                
+                                return True
+                            else:
+                                print_timestamped(f"⏰ JWT токен истек {abs(remaining_hours):.1f} часов назад")
+                                print_timestamped("🔄 Попытка обновления через embedded refresh token...")
+                                return await refresh_jwt_token()
+                    except Exception as e:
+                        print_timestamped(f"❌ Ошибка анализа JWT: {e}")
+                
+                # Для обычных токенов
+                if OAUTH_TOKENS.get('expires_at'):
+                    if datetime.now().timestamp() < OAUTH_TOKENS['expires_at']:
+                        print_timestamped("✅ OAuth токен еще действителен")
+                        return True
+                    else:
+                        print_timestamped("⏰ OAuth токен истек, попробую обновить...")
+                        return await refresh_oauth_token()
             
             return True
             
@@ -424,14 +1265,31 @@ async def apply_oauth_session(page):
     global OAUTH_TOKENS
     
     if not OAUTH_TOKENS.get('access_token'):
+        print_timestamped("❌ Нет access_token для применения сессии")
         return False
     
     try:
         print_timestamped("🔐 Применяю сохраненную OAuth сессию...")
         
+        # Определяем тип токена и способ получения
+        token_method = OAUTH_TOKENS.get('method', 'unknown')
+        last_refresh = OAUTH_TOKENS.get('last_refresh')
+        
+        print_timestamped(f"📊 Метод получения токена: {token_method}")
+        if last_refresh:
+            print_timestamped(f"🕐 Последнее обновление: {last_refresh}")
+        
+        if token_method == 'refresh_token_renewal':
+            print_timestamped("✨ ИСПОЛЬЗУЕТСЯ ТОКЕН, ОБНОВЛЕННЫЙ ЧЕРЕЗ REFRESH TOKEN!")
+            await send_telegram_message("🔄 ✅ Вход с токеном, обновленным через Refresh Token", is_verbose=False)
+        elif token_method == 'browser_extracted':
+            print_timestamped("🌐 Используется токен, извлеченный из браузера")
+        
         # Определяем ключ для localStorage на основе того, откуда был извлечен токен
         storage_key = OAUTH_TOKENS.get('storage_key', 'access_token')
         extracted_from = OAUTH_TOKENS.get('extracted_from', 'unknown')
+        
+        print_timestamped(f"🗂️  Источник токена: {extracted_from}, ключ: {storage_key}")
         
         if extracted_from == 'localStorage':
             # Инжектируем токен в localStorage с тем же ключом, что использовался
@@ -440,6 +1298,7 @@ async def apply_oauth_session(page):
                 await page.evaluate(f"""
                     localStorage.setItem('{storage_key}', '{OAUTH_TOKENS["access_token"]}');
                 """)
+                print_timestamped(f"💾 Токен внедрен в localStorage['{storage_key}']")
             else:
                 # Для других форматов токенов
                 await page.evaluate(f"""
@@ -447,11 +1306,13 @@ async def apply_oauth_session(page):
                     localStorage.setItem('token_type', 'Bearer');
                     localStorage.setItem('expires_at', '{OAUTH_TOKENS.get("expires_at", "")}');
                 """)
+                print_timestamped(f"💾 Токен внедрен в localStorage с дополнительными полями")
         elif extracted_from == 'sessionStorage':
             # Инжектируем в sessionStorage
             await page.evaluate(f"""
                 sessionStorage.setItem('{storage_key}', '{OAUTH_TOKENS["access_token"]}');
             """)
+            print_timestamped(f"💾 Токен внедрен в sessionStorage['{storage_key}']")
         elif extracted_from == 'cookies':
             # Добавляем cookie
             await page.context.add_cookies([{
@@ -460,6 +1321,7 @@ async def apply_oauth_session(page):
                 'domain': '.e-consul.gov.ua',
                 'path': '/'
             }])
+            print_timestamped(f"🍪 Токен внедрен как cookie '{storage_key}'")
         else:
             # Фоллбэк - пробуем стандартные варианты
             await page.evaluate(f"""
@@ -467,15 +1329,21 @@ async def apply_oauth_session(page):
                 localStorage.setItem('access_token', '{OAUTH_TOKENS["access_token"]}');
                 localStorage.setItem('token_type', 'Bearer');
             """)
+            print_timestamped("💾 Токен внедрен в localStorage (fallback режим)")
         
         # Перезагружаем страницу для применения токена
+        print_timestamped("🔄 Перезагружаю страницу для применения токена...")
         await page.reload(wait_until='networkidle')
         
         # Проверяем, что авторизация сработала
+        print_timestamped("✔️  Проверяю валидность сессии...")
         is_valid = await check_session_validity(page)
         
         if is_valid:
-            print_timestamped("✅ OAuth сессия успешно применена")
+            success_msg = "✅ OAuth сессия успешно применена"
+            if token_method == 'refresh_token_renewal':
+                success_msg += " (токен обновлен через Refresh Token)"
+            print_timestamped(success_msg)
             await send_telegram_message("🔐 Вход выполнен через сохраненную OAuth сессию", is_verbose=False)
             return True
         else:
@@ -498,36 +1366,113 @@ async def show_oauth_status():
             "• Сохранены для будущих сессий\n"
             "• В следующий раз авторизация будет автоматической\n\n"
             "⏱️ **Ожидаемая продолжительность сессии**: недели/месяцы\n"
-            "(вместо обычных 1-2 часов)"
         )
     else:
-        method = OAUTH_TOKENS.get('method', 'unknown')
-        expires_at = OAUTH_TOKENS.get('expires_at')
+        # Анализируем имеющиеся токены
+        token_method = OAUTH_TOKENS.get('method', 'unknown')
+        last_refresh = OAUTH_TOKENS.get('last_refresh', 'никогда')
+        extracted_from = OAUTH_TOKENS.get('extracted_from', 'unknown')
         
-        if expires_at:
+        status_msg = "🔐 **OAuth Статус**: Токены найдены\n\n"
+        
+        # Проверяем тип токена
+        if OAUTH_TOKENS.get('access_token', '').count('.') == 2:
+            status_msg += "🎫 **Тип токена**: JWT (с embedded refresh token)\n"
+            
             try:
-                expires_time = datetime.fromtimestamp(float(expires_at))
-                time_left = expires_time - datetime.now()
+                import base64
+                payload = OAUTH_TOKENS['access_token'].split('.')[1]
+                payload += '=' * (4 - len(payload) % 4)
+                decoded = base64.b64decode(payload)
+                jwt_data = json.loads(decoded)
                 
-                if time_left.total_seconds() > 0:
-                    hours_left = int(time_left.total_seconds() // 3600)
-                    status = f"✅ Активен (осталось ~{hours_left}ч)"
-                else:
-                    status = "⏰ Истек, будет обновлен автоматически"
-            except:
-                status = "❓ Неизвестно"
+                exp_time = jwt_data.get('exp')
+                if exp_time:
+                    exp_datetime = datetime.fromtimestamp(exp_time)
+                    remaining_hours = (exp_time - datetime.now().timestamp()) / 3600
+                    
+                    if remaining_hours > 0:
+                        status_msg += f"✅ **Действует до**: {exp_datetime.strftime('%d.%m.%Y %H:%M')}\n"
+                        status_msg += f"⏱️ **Осталось**: {remaining_hours:.1f} часов\n"
+                    else:
+                        status_msg += f"❌ **Истек**: {abs(remaining_hours):.1f} часов назад\n"
+                        status_msg += "🔄 **Будет обновлен** при следующем запуске\n"
+                    
+                    # Проверяем refresh token
+                    if 'authTokens' in jwt_data and 'refreshToken' in jwt_data['authTokens']:
+                        refresh_token = jwt_data['authTokens']['refreshToken']
+                        status_msg += f"🔄 **Refresh Token**: Доступен ({refresh_token[:20]}...)\n"
+                        status_msg += "✨ **Автообновление**: Поддерживается\n"
+                    
+            except Exception as e:
+                status_msg += f"⚠️ **Ошибка анализа JWT**: {e}\n"
         else:
-            status = "❓ Неизвестно"
+            status_msg += "🎫 **Тип токена**: Обычный OAuth\n"
         
-        status_msg = (
-            f"🔑 **OAuth Статус**: {status}\n"
-            f"📱 **Метод**: {method.upper()}\n"
-            f"🚀 **Автоматическая авторизация**: Включена\n\n"
-            "💡 При истечении токена будет попытка автообновления.\n"
-            "Если не получится - вернемся к QR-авторизации."
-        )
+        status_msg += f"\n📊 **Метод получения**: {token_method}\n"
+        status_msg += f"📍 **Источник**: {extracted_from}\n"
+        status_msg += f"🕐 **Последнее обновление**: {last_refresh}\n"
+        
+        if token_method == 'refresh_token_renewal':
+            status_msg += "\n✨ **Последний вход**: Через Refresh Token!\n"
+        elif token_method == 'browser_extracted':
+            status_msg += "\n🌐 **Последний вход**: Извлечен из браузера\n"
+        
+        status_msg += "\n🎯 **Следующий запуск**: Автоматический вход без QR-кода"
     
     await send_telegram_message(status_msg, is_verbose=False)
+
+async def check_refresh_token_availability():
+    """Проверяет доступность и валидность refresh token"""
+    global OAUTH_TOKENS
+    
+    print_timestamped("🔍 Проверяю доступность Refresh Token...")
+    
+    if not OAUTH_TOKENS.get('access_token'):
+        print_timestamped("❌ Нет access_token для анализа")
+        return False
+    
+    # Проверяем JWT токен на наличие embedded refresh token
+    if OAUTH_TOKENS['access_token'].count('.') == 2:
+        try:
+            import base64
+            payload = OAUTH_TOKENS['access_token'].split('.')[1]
+            payload += '=' * (4 - len(payload) % 4)
+            decoded = base64.b64decode(payload)
+            jwt_data = json.loads(decoded)
+            
+            if 'authTokens' in jwt_data and 'refreshToken' in jwt_data['authTokens']:
+                refresh_token = jwt_data['authTokens']['refreshToken']
+                print_timestamped(f"✅ Embedded Refresh Token найден: {refresh_token[:20]}...")
+                OAUTH_TOKENS['embedded_refresh_token'] = refresh_token
+                
+                # Проверяем срок действия основного токена
+                exp_time = jwt_data.get('exp')
+                if exp_time:
+                    remaining_hours = (exp_time - datetime.now().timestamp()) / 3600
+                    if remaining_hours < 1:  # Меньше часа до истечения
+                        print_timestamped("⏰ Токен скоро истечет, тестирую refresh...")
+                        return await refresh_jwt_token()
+                    else:
+                        print_timestamped(f"✅ Токен действителен еще {remaining_hours:.1f} часов")
+                        return True
+                
+                return True
+            else:
+                print_timestamped("❌ Embedded Refresh Token не найден в JWT")
+                return False
+                
+        except Exception as e:
+            print_timestamped(f"❌ Ошибка анализа JWT для refresh token: {e}")
+            return False
+    
+    # Проверяем обычный refresh token
+    if OAUTH_TOKENS.get('refresh_token'):
+        print_timestamped(f"✅ Обычный Refresh Token найден: {OAUTH_TOKENS['refresh_token'][:20]}...")
+        return True
+    
+    print_timestamped("❌ Refresh Token не найден")
+    return False
 
 # --- Глобальная переменная для текущего ID запроса ---
 CURRENT_REQUEST_ID = None
@@ -560,6 +1505,53 @@ def print_timestamped(message):
         request_info = f" [Запрос ID: {CURRENT_REQUEST_ID[:8]}...] "
 
     original_print(f"[{timestamp}]{process_info}{request_info} {message}")
+
+    # --- Вспомогательные функции для аудита ротации токенов ---
+    def _token_fingerprint(token: str) -> str:
+        try:
+            import hashlib
+            if not token:
+                return "<none>"
+            h = hashlib.sha256(token.encode('utf-8')).hexdigest()
+            return f"sha256:{h[:10]}"
+        except Exception:
+            # Фоллбэк на усеченный вид
+            return (token[:6] + "…" + token[-4:]) if token and len(token) > 12 else token or "<none>"
+
+    def _append_refresh_audit(prev_tokens: dict, new_tokens: dict, reason: str = "save"):
+        try:
+            os.makedirs(CONFIG['base_keys_dir'], exist_ok=True)
+            log_path = os.path.join(CONFIG['base_keys_dir'], 'refresh_audit.jsonl')
+
+            prev_access = (prev_tokens or {}).get('access_token')
+            prev_refresh = (prev_tokens or {}).get('embedded_refresh_token') or (prev_tokens or {}).get('refresh_token')
+            new_access = (new_tokens or {}).get('access_token')
+            new_refresh = (new_tokens or {}).get('embedded_refresh_token') or (new_tokens or {}).get('refresh_token')
+
+            access_changed = (prev_access is not None) and (new_access is not None) and (prev_access != new_access)
+            refresh_changed = (prev_refresh is not None) and (new_refresh is not None) and (prev_refresh != new_refresh)
+
+            if access_changed or refresh_changed:
+                record = {
+                    'ts': datetime.now().isoformat(),
+                    'reason': reason,
+                    'method': new_tokens.get('method'),
+                    'access_changed': access_changed,
+                    'refresh_changed': refresh_changed,
+                    'access_fp_old': _token_fingerprint(prev_access),
+                    'access_fp_new': _token_fingerprint(new_access),
+                    'refresh_fp_old': _token_fingerprint(prev_refresh),
+                    'refresh_fp_new': _token_fingerprint(new_refresh),
+                }
+                with open(log_path, 'a', encoding='utf-8') as lf:
+                    lf.write(json.dumps(record, ensure_ascii=False) + "\n")
+                # Быстрая видимость в консоли
+                if access_changed:
+                    print_timestamped(f"🔁 Access token обновился: {record['access_fp_old']} → {record['access_fp_new']}")
+                if refresh_changed:
+                    print_timestamped(f"🔁 Refresh token обновился: {record['refresh_fp_old']} → {record['refresh_fp_new']}")
+        except Exception as e:
+            print_timestamped(f"⚠️  Не удалось записать аудит ротации токенов: {e}")
 
 # --- КОНФИГУРАЦИЯ ---
 CONFIG = {
@@ -2331,24 +3323,33 @@ async def try_access(browser, page):
         if ("id.e-consul.gov.ua" in current_url or not is_logged_in) and OAUTH_TOKENS.get('access_token'):
             print_timestamped("🔐 Пробую войти через сохраненную OAuth сессию...")
             
-            if await apply_oauth_session(page):
+            oauth_success = await apply_oauth_session(page)
+            if oauth_success:
                 print_timestamped("✅ OAuth авторизация успешна, продолжаю работу")
                 return await perform_consular_steps(page)
             else:
                 print_timestamped("❌ OAuth сессия не сработала, переходим к обычной авторизации")
+                # Добавляем дополнительную проверку после неудачной OAuth сессии
+                current_is_logged_in = await check_session_validity(page)
+                if current_is_logged_in:
+                    print_timestamped("🔄 Неожиданно: сессия оказалась валидной после неудачной OAuth. Продолжаю работу")
+                    return await perform_consular_steps(page)
 
         if "id.e-consul.gov.ua" in current_url or not is_logged_in:
             print_timestamped("Сессия неактивна или истекла. Начинаю авторизацию.")
             await send_telegram_message("Требуется повторная авторизация!", is_verbose=False)
             await send_telegram_message("Сессия неактивна. Начинаю авторизацию.", is_verbose=True)
 
-            if os.path.exists(CONFIG['storage_state_path']):
+            # Удаляем storage_state только если OAuth тоже не сработала
+            if os.path.exists(CONFIG['storage_state_path']) and not OAUTH_TOKENS.get('access_token'):
                 try:
                     os.remove(CONFIG['storage_state_path'])
                     print_timestamped(f"Удален устаревший файл сессии: {CONFIG['storage_state_path']}")
                     await send_telegram_message("Устаревший файл сессии удален. Повторная авторизация.", is_verbose=True)
                 except Exception as ex:
                     print_timestamped(f"Ошибка при удалении файла сессии {CONFIG['storage_state_path']}: {ex}")
+            elif os.path.exists(CONFIG['storage_state_path']):
+                print_timestamped("🔐 OAuth токены есть, оставляю storage_state для повторного использования")
 
             if "id.e-consul.gov.ua" not in page.url:
                 print_timestamped(f"Переходим на страницу авторизации: {CONFIG['base_url']}")
@@ -2385,11 +3386,118 @@ async def main():
     parser.add_argument('--manual-mode', action='store_true', help="Запускает скрипт в ручном режиме для отладки.")
     # ИЗМЕНЕНИЕ: Добавлен новый аргумент для сброса данных
     parser.add_argument('--new', action='store_true', help="Запросить все данные заново, игнорируя сохраненные.")
+    parser.add_argument('--check-tokens', action='store_true', help="Проверить статус OAuth токенов и refresh token.")
+    parser.add_argument('--test-refresh', action='store_true', help="Тестировать refresh token (принудительно обновить токен).")
+    parser.add_argument('--test-browser-refresh', action='store_true', help="Тестировать refresh token через браузер.")
+    parser.add_argument('--test-session-restore', action='store_true', help="Тестировать refresh через восстановление сессии.")
+    parser.add_argument('--show-rotation-log', action='store_true', help="Показать историю ротации access/refresh токенов.")
+    parser.add_argument('--wait-until-expired', action='store_true', help="Дождаться истечения и сразу проверить автоматическое обновление.")
 
     args = parser.parse_args()
 
     CONFIG['process_id'] = args.process_id
     VERBOSE_TELEGRAM_NOTIFICATIONS = args.verbose_telegram
+
+    # Специальные режимы проверки токенов
+    if args.check_tokens:
+        print_timestamped("🔍 Режим проверки OAuth токенов")
+        await load_oauth_tokens()
+        await show_oauth_status()
+        await check_refresh_token_availability()
+        return
+
+    if args.show_rotation_log:
+        print_timestamped("📜 История ротации токенов (refresh_audit.jsonl):")
+        try:
+            log_path = os.path.join(CONFIG['base_keys_dir'], 'refresh_audit.jsonl')
+            if not os.path.exists(log_path):
+                print_timestamped("Пока записей нет.")
+            else:
+                with open(log_path, 'r', encoding='utf-8') as lf:
+                    lines = lf.readlines()[-20:]  # последние 20 записей
+                for line in lines:
+                    print_timestamped(line.strip())
+        except Exception as e:
+            print_timestamped(f"❌ Ошибка чтения лога ротации: {e}")
+        return
+        
+    if args.test_refresh:
+        print_timestamped("🧪 Режим тестирования refresh token")
+        await load_oauth_tokens()
+        if await check_refresh_token_availability():
+            print_timestamped("🔄 Принудительно тестирую refresh token...")
+            success = await refresh_jwt_token()
+            if success:
+                print_timestamped("✅ Refresh token работает!")
+                await send_telegram_message("✅ Refresh Token успешно протестирован!", is_verbose=False)
+            else:
+                print_timestamped("❌ Refresh token не работает")
+                await send_telegram_message("❌ Refresh Token не работает", is_verbose=False)
+        else:
+            print_timestamped("❌ Refresh token недоступен")
+        return
+
+    if args.wait_until_expired:
+        print_timestamped("⏳ Жду истечения текущего токена, затем автоматически проверю обновление...")
+        await load_oauth_tokens()
+        # Рассчитаем время до истечения для JWT
+        wait_seconds = None
+        if OAUTH_TOKENS.get('access_token') and OAUTH_TOKENS['access_token'].count('.') == 2:
+            try:
+                import base64
+                payload = OAUTH_TOKENS['access_token'].split('.')[1]
+                payload += '=' * (4 - len(payload) % 4)
+                decoded = base64.b64decode(payload)
+                jwt_data = json.loads(decoded)
+                exp_time = jwt_data.get('exp')
+                if exp_time:
+                    wait_seconds = max(0, int(exp_time - datetime.now().timestamp()) + 2)
+            except Exception as e:
+                print_timestamped(f"⚠️  Не удалось вычислить время истечения: {e}")
+        # Для обычного OAuth
+        if wait_seconds is None and OAUTH_TOKENS.get('expires_at'):
+            wait_seconds = max(0, int(OAUTH_TOKENS['expires_at'] - datetime.now().timestamp()) + 2)
+        if wait_seconds is None:
+            print_timestamped("❌ Не удалось определить время истечения токена")
+            return
+        print_timestamped(f"🕒 До истечения: ~{wait_seconds} сек. Засыпаю...")
+        await asyncio.sleep(min(wait_seconds, 6*3600))  # максимум 6 часов ожидания в одном запуске
+        print_timestamped("⏰ Истечение достигнуто (или таймаут). Пробую обновить токен...")
+        ok = await refresh_jwt_token()
+        print_timestamped("✅ Обновление сработало" if ok else "❌ Обновление не удалось")
+        return
+        
+    if args.test_browser_refresh:
+        print_timestamped("🧪 Режим тестирования refresh token через БРАУЗЕР")
+        await load_oauth_tokens()
+        if await check_refresh_token_availability():
+            print_timestamped("🔄 Принудительно тестирую refresh token через браузер...")
+            success = await refresh_jwt_token_browser()
+            if success:
+                print_timestamped("✅ Браузерный refresh token работает!")
+                await send_telegram_message("✅ Браузерный Refresh Token успешно протестирован!", is_verbose=False)
+            else:
+                print_timestamped("❌ Браузерный refresh token не работает")
+                await send_telegram_message("❌ Браузерный Refresh Token не работает", is_verbose=False)
+        else:
+            print_timestamped("❌ Refresh token недоступен")
+        return
+        
+    if args.test_session_restore:
+        print_timestamped("🧪 Режим тестирования refresh через ВОССТАНОВЛЕНИЕ СЕССИИ")
+        await load_oauth_tokens()
+        if await check_refresh_token_availability():
+            print_timestamped("🔄 Принудительно тестирую refresh через восстановление сессии...")
+            success = await refresh_jwt_token_via_session_restore()
+            if success:
+                print_timestamped("✅ Восстановление сессии работает!")
+                await send_telegram_message("✅ Refresh через восстановление сессии успешно протестирован!", is_verbose=False)
+            else:
+                print_timestamped("❌ Восстановление сессии не работает")
+                await send_telegram_message("❌ Refresh через восстановление сессии не работает", is_verbose=False)
+        else:
+            print_timestamped("❌ Refresh token недоступен")
+        return
 
     # ИЗМЕНЕНИЕ: Логика загрузки данных в зависимости от аргумента --new
     if args.new:
