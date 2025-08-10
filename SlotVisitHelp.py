@@ -94,12 +94,458 @@ async def smart_click_element(page, selectors_list, element_description="эле�
             return False
     return False
 
+async def intercept_oauth_tokens(page, auth_method='unknown'):
+    """
+    Перехватывает OAuth токены во время авторизации через QR
+    
+    Args:
+        page: объект страницы Playwright
+        auth_method: метод авторизации ('diia' или 'bankid')
+    
+    Returns:
+        dict: перехваченные токены или None
+    """
+    global OAUTH_TOKENS
+    captured_data = {
+        'token_requests': [],
+        'auth_responses': [],
+        'client_credentials': {}
+    }
+    
+    print_timestamped(f"🔍 Начинаю перехват OAuth токенов для метода: {auth_method}")
+    
+    async def handle_response(response):
+        try:
+            url = response.url.lower()
+            
+            # Ищем ответы с токенами
+            if any(keyword in url for keyword in ['token', 'oauth', 'auth']) and response.status == 200:
+                try:
+                    response_text = await response.text()
+                    print_timestamped(f"🔍 Ответ токен-эндпоинта: {response.url}")
+                    
+                    # Пытаемся распарсить JSON с токенами
+                    try:
+                        import json
+                        token_data = json.loads(response_text)
+                        
+                        if 'access_token' in token_data:
+                            print_timestamped("  🎉 Найден access_token!")
+                            captured_data['auth_responses'].append({
+                                'url': response.url,
+                                'tokens': token_data,
+                                'timestamp': datetime.now().isoformat()
+                            })
+                            
+                            # Сохраняем токены глобально
+                            OAUTH_TOKENS.update({
+                                'access_token': token_data.get('access_token'),
+                                'refresh_token': token_data.get('refresh_token'),
+                                'expires_at': (datetime.now().timestamp() + 
+                                             token_data.get('expires_in', 3600)),
+                                'token_endpoint': response.url,
+                                'method': auth_method
+                            })
+                            
+                            await send_telegram_message(
+                                f"🔑 OAuth токены перехвачены! Метод: {auth_method}", 
+                                is_verbose=False
+                            )
+                            
+                            # Сохраняем токены в файл сразу после перехвата
+                            await save_oauth_tokens()
+                            
+                    except json.JSONDecodeError:
+                        pass
+                        
+                except Exception as e:
+                    print_timestamped(f"  ⚠️ Ошибка обработки ответа: {e}")
+        except Exception as e:
+            # Игнорируем ошибки перехвата, чтобы не ломать основной поток
+            pass
+    
+    # Устанавливаем только обработчик ответов (более безопасный)
+    try:
+        page.on("response", handle_response)
+        print_timestamped(f"✅ Перехватчик ответов установлен для {auth_method}")
+    except Exception as e:
+        print_timestamped(f"⚠️ Не удалось установить перехватчик: {e}")
+    
+    return captured_data
+
+async def extract_tokens_from_browser(page):
+    """
+    Извлекает OAuth токены из localStorage, sessionStorage или cookies браузера
+    
+    Args:
+        page: объект страницы Playwright
+    """
+    global OAUTH_TOKENS
+    
+    try:
+        print_timestamped("🔍 Попытка извлечь токены из браузера...")
+        
+        # Извлекаем все данные из localStorage
+        local_storage = await page.evaluate("""
+            () => {
+                const storage = {};
+                for (let i = 0; i < localStorage.length; i++) {
+                    const key = localStorage.key(i);
+                    storage[key] = localStorage.getItem(key);
+                }
+                return storage;
+            }
+        """)
+        
+        # Извлекаем все данные из sessionStorage
+        session_storage = await page.evaluate("""
+            () => {
+                const storage = {};
+                for (let i = 0; i < sessionStorage.length; i++) {
+                    const key = sessionStorage.key(i);
+                    storage[key] = sessionStorage.getItem(key);
+                }
+                return storage;
+            }
+        """)
+        
+        # Проверяем localStorage на наличие токенов
+        for key, value in local_storage.items():
+            if any(token_key in key.lower() for token_key in ['access', 'token', 'auth', 'bearer', 'jwt']):
+                print_timestamped(f"🔍 Найден потенциальный токен в localStorage: {key}")
+                try:
+                    # Пытаемся распарсить как JSON
+                    import json
+                    if value.startswith('{'):
+                        token_data = json.loads(value)
+                        if 'access_token' in token_data or 'accessToken' in token_data:
+                            access_token = token_data.get('access_token') or token_data.get('accessToken')
+                            OAUTH_TOKENS.update({
+                                'access_token': access_token,
+                                'method': 'browser_extracted',
+                                'extracted_from': 'localStorage',
+                                'storage_key': key
+                            })
+                            print_timestamped(f"✅ Токен извлечен из localStorage ключ: {key}")
+                            return
+                    else:
+                        # Обычная строка, возможно это сам токен
+                        if len(value) > 20:  # Минимальная длина токена
+                            OAUTH_TOKENS.update({
+                                'access_token': value,
+                                'method': 'browser_extracted',
+                                'extracted_from': 'localStorage',
+                                'storage_key': key
+                            })
+                            print_timestamped(f"✅ Токен извлечен из localStorage ключ: {key}")
+                            return
+                except:
+                    pass
+        
+        # Проверяем sessionStorage
+        for key, value in session_storage.items():
+            if any(token_key in key.lower() for token_key in ['access', 'token', 'auth', 'bearer', 'jwt']):
+                print_timestamped(f"🔍 Найден потенциальный токен в sessionStorage: {key}")
+                try:
+                    import json
+                    if value.startswith('{'):
+                        token_data = json.loads(value)
+                        if 'access_token' in token_data or 'accessToken' in token_data:
+                            access_token = token_data.get('access_token') or token_data.get('accessToken')
+                            OAUTH_TOKENS.update({
+                                'access_token': access_token,
+                                'method': 'browser_extracted',
+                                'extracted_from': 'sessionStorage',
+                                'storage_key': key
+                            })
+                            print_timestamped(f"✅ Токен извлечен из sessionStorage ключ: {key}")
+                            return
+                    else:
+                        if len(value) > 20:
+                            OAUTH_TOKENS.update({
+                                'access_token': value,
+                                'method': 'browser_extracted',
+                                'extracted_from': 'sessionStorage',
+                                'storage_key': key
+                            })
+                            print_timestamped(f"✅ Токен извлечен из sessionStorage ключ: {key}")
+                            return
+                except:
+                    pass
+        
+        # Если токены не найдены в storage, проверяем cookies
+        cookies = await page.context.cookies()
+        for cookie in cookies:
+            if any(token_key in cookie['name'].lower() for token_key in ['access', 'token', 'auth', 'bearer', 'jwt']):
+                print_timestamped(f"🔍 Найден потенциальный токен в cookies: {cookie['name']}")
+                if len(cookie['value']) > 20:
+                    OAUTH_TOKENS.update({
+                        'access_token': cookie['value'],
+                        'method': 'browser_extracted',
+                        'extracted_from': 'cookies',
+                        'storage_key': cookie['name']
+                    })
+                    print_timestamped(f"✅ Токен извлечен из cookies: {cookie['name']}")
+                    return
+        
+        print_timestamped("❌ Токены не найдены в браузере")
+        
+    except Exception as e:
+        print_timestamped(f"❌ Ошибка извлечения токенов из браузера: {e}")
+
+async def refresh_oauth_token():
+    """
+    Обновляет access_token используя refresh_token
+    
+    Returns:
+        bool: успешность обновления
+    """
+    global OAUTH_TOKENS
+    
+    if not OAUTH_TOKENS.get('refresh_token') or not OAUTH_TOKENS.get('token_endpoint'):
+        print_timestamped("❌ Нет refresh_token или token_endpoint для обновления")
+        return False
+    
+    print_timestamped("🔄 Обновляю OAuth токен...")
+    
+    try:
+        import httpx
+        
+        token_data = {
+            'grant_type': 'refresh_token',
+            'refresh_token': OAUTH_TOKENS['refresh_token']
+        }
+        
+        headers = {}
+        
+        # Добавляем client credentials если есть
+        if OAUTH_TOKENS.get('client_id') and OAUTH_TOKENS.get('client_secret'):
+            import base64
+            credentials = f"{OAUTH_TOKENS['client_id']}:{OAUTH_TOKENS['client_secret']}"
+            encoded = base64.b64encode(credentials.encode()).decode()
+            headers['Authorization'] = f'Basic {encoded}'
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                OAUTH_TOKENS['token_endpoint'],
+                data=token_data,
+                headers=headers,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                new_tokens = response.json()
+                
+                OAUTH_TOKENS.update({
+                    'access_token': new_tokens.get('access_token'),
+                    'expires_at': (datetime.now().timestamp() + 
+                                 new_tokens.get('expires_in', 3600))
+                })
+                
+                # Обновляем refresh_token если пришел новый
+                if 'refresh_token' in new_tokens:
+                    OAUTH_TOKENS['refresh_token'] = new_tokens['refresh_token']
+                
+                print_timestamped("✅ OAuth токен успешно обновлен")
+                await send_telegram_message("🔄 OAuth токен обновлен автоматически", is_verbose=True)
+                
+                # Сохраняем обновленные токены
+                await save_oauth_tokens()
+                
+                return True
+            else:
+                print_timestamped(f"❌ Ошибка обновления токена: {response.status_code} {response.text}")
+                return False
+                
+    except Exception as e:
+        print_timestamped(f"❌ Исключение при обновлении токена: {e}")
+        return False
+
+async def save_oauth_tokens():
+    """Сохраняет OAuth токены в файл"""
+    global OAUTH_TOKENS
+    
+    if not any(OAUTH_TOKENS.values()):
+        return
+    
+    try:
+        # Используем фиксированное имя файла, не привязанное к process_id
+        tokens_file = os.path.join(CONFIG['base_keys_dir'], "oauth_tokens.json")
+        
+        # Убираем None значения перед сохранением
+        clean_tokens = {k: v for k, v in OAUTH_TOKENS.items() if v is not None}
+        
+        with open(tokens_file, 'w', encoding='utf-8') as f:
+            json.dump(clean_tokens, f, indent=2, ensure_ascii=False)
+        
+        print_timestamped(f"💾 OAuth токены сохранены в: {tokens_file}")
+        
+    except Exception as e:
+        print_timestamped(f"❌ Ошибка сохранения OAuth токенов: {e}")
+
+async def load_oauth_tokens():
+    """Загружает OAuth токены из файла"""
+    global OAUTH_TOKENS
+    
+    try:
+        # Используем фиксированное имя файла, не привязанное к process_id
+        tokens_file = os.path.join(CONFIG['base_keys_dir'], "oauth_tokens.json")
+        
+        if os.path.exists(tokens_file):
+            with open(tokens_file, 'r', encoding='utf-8') as f:
+                saved_tokens = json.load(f)
+            
+            OAUTH_TOKENS.update(saved_tokens)
+            print_timestamped(f"📁 OAuth токены загружены из: {tokens_file}")
+            
+            # Проверяем срок действия
+            if OAUTH_TOKENS.get('expires_at'):
+                if datetime.now().timestamp() < OAUTH_TOKENS['expires_at']:
+                    print_timestamped("✅ OAuth токен еще действителен")
+                    return True
+                else:
+                    print_timestamped("⏰ OAuth токен истек, попробую обновить...")
+                    return await refresh_oauth_token()
+            
+            return True
+            
+    except Exception as e:
+        print_timestamped(f"❌ Ошибка загрузки OAuth токенов: {e}")
+    
+    return False
+
+async def apply_oauth_session(page):
+    """
+    Применяет сохраненную OAuth сессию к странице
+    
+    Returns:
+        bool: успешность применения сессии
+    """
+    global OAUTH_TOKENS
+    
+    if not OAUTH_TOKENS.get('access_token'):
+        return False
+    
+    try:
+        print_timestamped("🔐 Применяю сохраненную OAuth сессию...")
+        
+        # Определяем ключ для localStorage на основе того, откуда был извлечен токен
+        storage_key = OAUTH_TOKENS.get('storage_key', 'access_token')
+        extracted_from = OAUTH_TOKENS.get('extracted_from', 'unknown')
+        
+        if extracted_from == 'localStorage':
+            # Инжектируем токен в localStorage с тем же ключом, что использовался
+            if storage_key == 'token':
+                # Если токен был JWT, сохраняем его как есть
+                await page.evaluate(f"""
+                    localStorage.setItem('{storage_key}', '{OAUTH_TOKENS["access_token"]}');
+                """)
+            else:
+                # Для других форматов токенов
+                await page.evaluate(f"""
+                    localStorage.setItem('{storage_key}', '{OAUTH_TOKENS["access_token"]}');
+                    localStorage.setItem('token_type', 'Bearer');
+                    localStorage.setItem('expires_at', '{OAUTH_TOKENS.get("expires_at", "")}');
+                """)
+        elif extracted_from == 'sessionStorage':
+            # Инжектируем в sessionStorage
+            await page.evaluate(f"""
+                sessionStorage.setItem('{storage_key}', '{OAUTH_TOKENS["access_token"]}');
+            """)
+        elif extracted_from == 'cookies':
+            # Добавляем cookie
+            await page.context.add_cookies([{
+                'name': storage_key,
+                'value': OAUTH_TOKENS["access_token"],
+                'domain': '.e-consul.gov.ua',
+                'path': '/'
+            }])
+        else:
+            # Фоллбэк - пробуем стандартные варианты
+            await page.evaluate(f"""
+                localStorage.setItem('token', '{OAUTH_TOKENS["access_token"]}');
+                localStorage.setItem('access_token', '{OAUTH_TOKENS["access_token"]}');
+                localStorage.setItem('token_type', 'Bearer');
+            """)
+        
+        # Перезагружаем страницу для применения токена
+        await page.reload(wait_until='networkidle')
+        
+        # Проверяем, что авторизация сработала
+        is_valid = await check_session_validity(page)
+        
+        if is_valid:
+            print_timestamped("✅ OAuth сессия успешно применена")
+            await send_telegram_message("🔐 Вход выполнен через сохраненную OAuth сессию", is_verbose=False)
+            return True
+        else:
+            print_timestamped("❌ OAuth сессия не сработала, требуется повторная авторизация")
+            return False
+    
+    except Exception as e:
+        print_timestamped(f"❌ Ошибка применения OAuth сессии: {e}")
+        return False
+
+async def show_oauth_status():
+    """Показывает статус OAuth токенов пользователю"""
+    global OAUTH_TOKENS
+    
+    if not any(OAUTH_TOKENS.values()):
+        status_msg = (
+            "📱 **OAuth Статус**: Нет сохраненных токенов\n\n"
+            "💡 **При первой авторизации через QR-код** (Дія или BankID):\n"
+            "• Токены будут автоматически перехвачены\n"
+            "• Сохранены для будущих сессий\n"
+            "• В следующий раз авторизация будет автоматической\n\n"
+            "⏱️ **Ожидаемая продолжительность сессии**: недели/месяцы\n"
+            "(вместо обычных 1-2 часов)"
+        )
+    else:
+        method = OAUTH_TOKENS.get('method', 'unknown')
+        expires_at = OAUTH_TOKENS.get('expires_at')
+        
+        if expires_at:
+            try:
+                expires_time = datetime.fromtimestamp(float(expires_at))
+                time_left = expires_time - datetime.now()
+                
+                if time_left.total_seconds() > 0:
+                    hours_left = int(time_left.total_seconds() // 3600)
+                    status = f"✅ Активен (осталось ~{hours_left}ч)"
+                else:
+                    status = "⏰ Истек, будет обновлен автоматически"
+            except:
+                status = "❓ Неизвестно"
+        else:
+            status = "❓ Неизвестно"
+        
+        status_msg = (
+            f"🔑 **OAuth Статус**: {status}\n"
+            f"📱 **Метод**: {method.upper()}\n"
+            f"🚀 **Автоматическая авторизация**: Включена\n\n"
+            "💡 При истечении токена будет попытка автообновления.\n"
+            "Если не получится - вернемся к QR-авторизации."
+        )
+    
+    await send_telegram_message(status_msg, is_verbose=False)
+
 # --- Глобальная переменная для текущего ID запроса ---
 CURRENT_REQUEST_ID = None
 
 # --- Счетчик последовательных ошибок ---
 CONSECUTIVE_ERRORS = 0
 LAST_ERROR_TYPE = None
+
+# --- OAuth токены для долговечной авторизации ---
+OAUTH_TOKENS = {
+    'client_id': None,
+    'client_secret': None,
+    'access_token': None,
+    'refresh_token': None,
+    'expires_at': None,
+    'token_endpoint': None,
+    'method': None  # 'diia' или 'bankid'
+}
 
 # --- Вспомогательная функция для логирования с меткой времени ---
 original_print = print
@@ -675,10 +1121,15 @@ async def perform_login_steps(page):
 
     if auth_method == 'diia':
         await send_telegram_message("Шаг 1: Выбран метод 'Дія.Підпис'. Начинаю авторизацию.", is_verbose=True)
+        
         try:
             diia_button_selector = 'button:has-text("Дія.Підпис")'
             await page.locator(diia_button_selector).wait_for(state='visible', timeout=20000)
             print_timestamped("Нажимаю кнопку 'Дія.Підпис'...")
+            
+            # Включаем перехват OAuth токенов для Дія ПОСЛЕ нахождения кнопки
+            await intercept_oauth_tokens(page, 'diia')
+            
             await page.locator(diia_button_selector).click(timeout=30000)
             print_timestamped("Ожидаю загрузки QR-кода на текущей странице...")
             await page.wait_for_load_state('networkidle', timeout=CONFIG['timeout'])
@@ -693,7 +1144,7 @@ async def perform_login_steps(page):
             await page.wait_for_timeout(1000)
             qr_path = await save_screenshot(page, "diia_qr_code_capture", locator=qr_element, timeout=CONFIG['timeout'])
             if qr_path:
-                await send_telegram_photo(qr_path, "Відскануйте QR-код у застосунку 'Дія' для авторизації.")
+                await send_telegram_photo(qr_path, "🔐 Відскануйте QR-код у застосунку 'Дія' для авторизації.\n\n💡 При первой авторизации токены будут сохранены для долговечных сессий!")
                 await send_telegram_message("QR-код для 'Дія' отправлен. Ожидаю подтверждения в приложении...", is_verbose=False)
             else:
                 error_msg = "Не удалось создать скриншот QR-кода для 'Дія.Підпис'."
@@ -704,6 +1155,12 @@ async def perform_login_steps(page):
             await page.wait_for_url("**/e-consul.gov.ua/**", timeout=CONFIG['timeout'])
             await page.wait_for_load_state('networkidle', timeout=CONFIG['timeout'])
             print_timestamped(f"Авторизация через 'Дія.Підпис' успешно завершена. Текущий URL: {page.url}")
+            
+            # Сохраняем OAuth токены если они были перехвачены
+            if OAUTH_TOKENS.get('access_token'):
+                await save_oauth_tokens()
+                await send_telegram_message("🔑 OAuth токены сохранены! В следующий раз авторизация будет автоматической.", is_verbose=False)
+            
             await page.context.storage_state(path=CONFIG['storage_state_path'])
             print_timestamped(f"Состояние сессии сохранено после успешной авторизации в: {CONFIG['storage_state_path']}")
             await send_telegram_message("Шаг 1.3 завершен: Успешная авторизация и сохранение сессии.", is_verbose=False)
@@ -904,6 +1361,10 @@ async def perform_login_steps(page):
         await send_telegram_message("Шаг 2: Клик по 'Bank ID НБУ'.", is_verbose=True)
         try:
             await page.get_by_text("Bank ID НБУ").wait_for(state='visible', timeout=10000)
+            
+            # Включаем перехват OAuth токенов для BankID ПОСЛЕ нахождения кнопки
+            await intercept_oauth_tokens(page, 'bankid')
+            
             async with page.expect_navigation(url="**/id.gov.ua/bankid-nbu-auth**", timeout=CONFIG['timeout']):
                 await page.get_by_text("Bank ID НБУ").click(timeout=30000)
             await page.wait_for_load_state('networkidle', timeout=CONFIG['timeout'])
@@ -973,6 +1434,16 @@ async def perform_login_steps(page):
                 await page.locator(continue_data_confirm_selector).click(timeout=30000)
             await page.wait_for_load_state('networkidle', timeout=CONFIG['timeout'])
             print_timestamped(f"Авторизация успешно завершена и перешли на e-consul.gov.ua. Текущий URL: {page.url}")
+            
+            # Пытаемся извлечь токены из браузера если они не были перехвачены автоматически
+            if not OAUTH_TOKENS.get('access_token'):
+                await extract_tokens_from_browser(page)
+            
+            # Сохраняем OAuth токены если они были перехвачены или извлечены
+            if OAUTH_TOKENS.get('access_token'):
+                await save_oauth_tokens()
+                await send_telegram_message("🔑 OAuth токены сохранены! В следующий раз авторизация будет автоматической.", is_verbose=False)
+            
             await page.context.storage_state(path=CONFIG['storage_state_path'])
             print_timestamped(f"Состояние сессии сохранено после успешной авторизации в: {CONFIG['storage_state_path']}")
             await send_telegram_message(f"Шаг 5 завершен: Успешная авторизация и сохранение сессии.", is_verbose=False)
@@ -1856,6 +2327,16 @@ async def try_access(browser, page):
         current_url = page.url
         is_logged_in = await check_session_validity(page)
 
+        # Если не авторизованы, пробуем OAuth сессию
+        if ("id.e-consul.gov.ua" in current_url or not is_logged_in) and OAUTH_TOKENS.get('access_token'):
+            print_timestamped("🔐 Пробую войти через сохраненную OAuth сессию...")
+            
+            if await apply_oauth_session(page):
+                print_timestamped("✅ OAuth авторизация успешна, продолжаю работу")
+                return await perform_consular_steps(page)
+            else:
+                print_timestamped("❌ OAuth сессия не сработала, переходим к обычной авторизации")
+
         if "id.e-consul.gov.ua" in current_url or not is_logged_in:
             print_timestamped("Сессия неактивна или истекла. Начинаю авторизацию.")
             await send_telegram_message("Требуется повторная авторизация!", is_verbose=False)
@@ -1918,13 +2399,21 @@ async def main():
         # Пытаемся загрузить данные из последнего запуска
         await load_last_user_data()
 
-    CONFIG['storage_state_path'] = os.path.join(CONFIG['base_sessions_dir'], f"session_state_{CONFIG['process_id']}.json")
+    CONFIG['storage_state_path'] = os.path.join(CONFIG['base_sessions_dir'], "session_state.json")
     CONFIG['screenshots_dir'] = os.path.join(CONFIG['base_screenshots_dir'], f"process_{CONFIG['process_id']}")
     os.makedirs(CONFIG['base_keys_dir'], exist_ok=True)
     os.makedirs(CONFIG['base_sessions_dir'], exist_ok=True)
     os.makedirs(CONFIG['base_screenshots_dir'], exist_ok=True)
 
     print_timestamped(f"--- ПРОЦЕСС ID: {CONFIG['process_id']} ---")
+    
+    # Загружаем сохраненные OAuth токены
+    oauth_loaded = await load_oauth_tokens()
+    if oauth_loaded:
+        print_timestamped("🔐 OAuth токены загружены, попробую использовать сохраненную сессию")
+    
+    # Показываем статус OAuth пользователю
+    await show_oauth_status()
 
     if args.manual_mode:
         run_headless_browser = False
