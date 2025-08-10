@@ -3223,10 +3223,34 @@ async def perform_consular_steps(page):
     retry_attempts = 0
     while retry_attempts < CONFIG['max_reload_attempts']:
         current_url = page.url
+        
+        # Проверяем разные типы редиректов
         if "dateAndTimeVisitInfo" not in current_url:
-            print_timestamped(f"ВНИМАНИЕ: Обнаружен редирект со страницы поиска слотов. Текущий URL: {current_url}. Прерываю поиск.")
-            await send_telegram_message(f"Сессия сброшена, скрипт был перенаправлен на страницу: {current_url}. Поиск слотов остановлен.", is_verbose=True)
-            raise SessionResetException("Session was reset, restarting the process.")
+            if "consularServiceInfo" in current_url:
+                print_timestamped(f"📋 Система перенаправила на обновление данных услуги: {current_url}")
+                print_timestamped("🔄 Возвращаюсь к основной логике заполнения данных...")
+                await send_telegram_message("Система требует обновления данных услуги. Переходим к заполнению...", is_verbose=False)
+                
+                # Возвращаемся к основной функции для обработки
+                return await perform_consular_steps(page)
+                    
+            elif "id.e-consul.gov.ua" in current_url:
+                print_timestamped(f"🔐 Обнаружен редирект на авторизацию: {current_url}")
+                await send_telegram_message("Сессия истекла, требуется повторная авторизация.", is_verbose=False)
+                raise SessionResetException("Session expired, redirected to authentication.")
+                
+            else:
+                print_timestamped(f"⚠️  Неожиданный редирект: {current_url}")
+                await send_telegram_message(f"Неожиданный редирект на: {current_url}", is_verbose=True)
+                # Подождем немного и проверим еще раз
+                await page.wait_for_timeout(5000)
+                current_url_recheck = page.url
+                if "dateAndTimeVisitInfo" in current_url_recheck:
+                    print_timestamped("✅ После ожидания вернулись на страницу поиска слотов")
+                    continue
+                else:
+                    raise SessionResetException(f"Unexpected redirect to: {current_url}")
+                    
         print_timestamped(f"Попытка {retry_attempts + 1}/{CONFIG['max_reload_attempts']}: Ожидаю сообщения о поиске слотов.")
         await send_telegram_message(f"Попытка {retry_attempts + 1}: Ожидание сообщения о поиске слотов.", is_verbose=True)
         try:
