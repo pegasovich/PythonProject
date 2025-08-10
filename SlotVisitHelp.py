@@ -25,8 +25,81 @@ class SessionResetException(Exception):
     """Исключение, вызываемое при сбросе сессии на сайте."""
     pass
 
+async def smart_find_element(page, selectors_list, element_description="элемент", timeout=None):
+    """
+    Умный поиск элемента с несколькими селекторами и детальным логированием
+    
+    Args:
+        page: объект страницы Playwright
+        selectors_list: список селекторов для поиска
+        element_description: описание элемента для логирования
+        timeout: таймаут для поиска (по умолчанию из CONFIG)
+    
+    Returns:
+        locator: найденный элемент или None
+    """
+    if timeout is None:
+        timeout = CONFIG.get('element_search_timeout', 15000)
+    
+    print_timestamped(f"Поиск элемента: {element_description}")
+    
+    for i, selector in enumerate(selectors_list):
+        try:
+            print_timestamped(f"  Попытка {i+1}/{len(selectors_list)}: {selector}")
+            locator = page.locator(selector)
+            await locator.wait_for(state='visible', timeout=timeout//len(selectors_list))
+            print_timestamped(f"  ✓ Элемент найден с селектором: {selector}")
+            return locator
+        except Exception as e:
+            print_timestamped(f"  ✗ Селектор не сработал: {selector} - {str(e)[:100]}")
+            continue
+    
+    # Делаем скриншот для диагностики
+    screenshot_path = await save_screenshot(page, f"error_element_not_found_{element_description}")
+    if screenshot_path:
+        await send_telegram_photo(screenshot_path, f"Не найден элемент: {element_description}")
+    
+    print_timestamped(f"  ❌ ОШИБКА: Не удалось найти элемент '{element_description}' ни одним из селекторов")
+    await send_telegram_message(f"❌ Не найден элемент: {element_description}", is_verbose=False)
+    
+    return None
+
+async def smart_fill_field(page, selectors_list, value, field_description="поле"):
+    """
+    Умное заполнение поля с несколькими селекторами
+    """
+    locator = await smart_find_element(page, selectors_list, field_description)
+    if locator:
+        try:
+            await locator.fill(str(value), timeout=10000)
+            print_timestamped(f"  ✓ Поле '{field_description}' заполнено значением: {value}")
+            return True
+        except Exception as e:
+            print_timestamped(f"  ✗ Ошибка заполнения поля '{field_description}': {e}")
+            return False
+    return False
+
+async def smart_click_element(page, selectors_list, element_description="элемент"):
+    """
+    Умное нажатие на элемент с несколькими селекторами
+    """
+    locator = await smart_find_element(page, selectors_list, element_description)
+    if locator:
+        try:
+            await locator.click(timeout=10000)
+            print_timestamped(f"  ✓ Клик по элементу: {element_description}")
+            return True
+        except Exception as e:
+            print_timestamped(f"  ✗ Ошибка клика по элементу '{element_description}': {e}")
+            return False
+    return False
+
 # --- Глобальная переменная для текущего ID запроса ---
 CURRENT_REQUEST_ID = None
+
+# --- Счетчик последовательных ошибок ---
+CONSECUTIVE_ERRORS = 0
+LAST_ERROR_TYPE = None
 
 # --- Вспомогательная функция для логирования с меткой времени ---
 original_print = print
@@ -48,9 +121,11 @@ CONFIG = {
     'timeout': 170000,
     'user_agent': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     'retry_count': 1,
+    'max_consecutive_errors': 3,  # Максимальное количество ошибок подряд
+    'element_search_timeout': 15000,  # Таймаут для поиска элементов
     # ИЗМЕНЕНИЕ: Токен и ID чата теперь загружаются из файла .env
-    'telegram_bot_token': os.getenv('TELEGRAM_BOT_TOKEN'),
-    'telegram_chat_id': os.getenv('TELEGRAM_CHAT_ID'),
+    'telegram_bot_token': os.getenv('PROD_BOT_TOKEN'),
+    'telegram_chat_id': os.getenv('MY_TELEGRAM_ID'),
     'max_reload_attempts': 999999999,
     'reload_delay_seconds': 5,
     'post_search_delay_seconds': 3,
@@ -1061,8 +1136,14 @@ async def perform_consular_steps(page):
         visit_record_nav_selector = '#main-container > div > div > header > div.jss44 > div > div.jss38 > a'
         await page.locator(visit_record_nav_selector).wait_for(state='visible', timeout=15000)
         print_timestamped("Элемент 'Запис на візит' в навигации стал видимым.")
-        async with page.expect_navigation(url="**/e-consul.gov.ua/visits**", timeout=CONFIG['timeout']):
-            await page.locator(visit_record_nav_selector).click(timeout=20000)
+        try:
+            async with page.expect_navigation(url="**/e-consul.gov.ua/visits**", timeout=CONFIG['timeout']):
+                await page.locator(visit_record_nav_selector).click(timeout=20000)
+        except Exception as nav_error:
+            if "closed" in str(nav_error).lower() or "target" in str(nav_error).lower():
+                print_timestamped(f"Браузер/страница закрыты во время навигации: {nav_error}")
+                raise Exception("Браузер закрыт во время навигации")
+            raise nav_error
         await page.wait_for_load_state('networkidle', timeout=CONFIG['timeout'])
         print_timestamped(f"Успешно перешли на страницу Мої візити. Текущий URL: {page.url}")
         await send_telegram_message("Шаг 6 завершен: Переход на страницу 'Мої візити'.", is_verbose=True)
@@ -1082,8 +1163,14 @@ async def perform_consular_steps(page):
         book_visit_button_selector = '#main-container > div.jss30 > div.jss32 > main > div > div:nth-child(4) > div > a'
         await page.locator(book_visit_button_selector).wait_for(state='visible', timeout=20000)
         print_timestamped("Кнопка 'Записатись на візит' стала видимой.")
-        async with page.expect_navigation(timeout=CONFIG['timeout']):
-            await page.locator(book_visit_button_selector).click(timeout=30000)
+        try:
+            async with page.expect_navigation(timeout=CONFIG['timeout']):
+                await page.locator(book_visit_button_selector).click(timeout=30000)
+        except Exception as nav_error:
+            if "closed" in str(nav_error).lower() or "target" in str(nav_error).lower():
+                print_timestamped(f"Браузер/страница закрыты во время навигации: {nav_error}")
+                raise Exception("Браузер закрыт во время навигации")
+            raise nav_error
         await page.wait_for_load_state('networkidle', timeout=CONFIG['timeout'])
         print_timestamped(f"Успешно перешли на страницу формы записи на визит. Текущий URL: {page.url}")
         await send_telegram_message("Шаг 7 завершен: Переход на страницу формы записи.", is_verbose=True)
@@ -1220,24 +1307,78 @@ async def perform_consular_steps(page):
                 raise Exception("Пользователь не выбрал дату рождения в течение 5 минут.")
 
         print_timestamped("Заполняю данные заявителя на странице...")
-        day_selector = 'input[aria-label="день"]'
+        
+        # Ждем появления полей формы
+        await page.wait_for_load_state('networkidle', timeout=15000)
+        
+        # Умное заполнение поля дня
+        day_selectors = [
+            'input[aria-label="день"]',
+            'input[placeholder*="день"]',
+            'input[name*="day"]',
+            'input[name*="Day"]',
+            'input[id*="day"]'
+        ]
+        
+        if not await smart_fill_field(page, day_selectors, dob.day, "день рождения"):
+            raise Exception("Не удалось заполнить поле дня рождения")
+        
+        # Умное заполнение поля года
+        year_selectors = [
+            'input[aria-label="рік"]',
+            'input[placeholder*="рік"]',
+            'input[name*="year"]',
+            'input[name*="Year"]',
+            'input[id*="year"]'
+        ]
+        
+        if not await smart_fill_field(page, year_selectors, dob.year, "год рождения"):
+            raise Exception("Не удалось заполнить поле года рождения")
+            
+        # Селекторы для месяца и пола
         month_selector = 'div[aria-label="місяць"]'
-        year_selector = 'input[aria-label="рік"]'
         male_radio_selector = 'input[type="radio"][value=""][id^="gender-Ч"]'
         female_radio_selector = 'input[type="radio"][value=""][id^="gender-Ж"]'
         next_button_selector = '#next-step-button'
-        await page.locator(day_selector).fill(str(dob.day), timeout=10000)
-        await page.locator(year_selector).fill(str(dob.year), timeout=10000)
+            
         month_names_uk = ["", "січня", "лютого", "березня", "квітня", "травня", "червня", "липня", "серпня", "вересня", "жовтня", "листопада", "грудня"]
         target_month_name = month_names_uk[dob.month]
         print_timestamped(f"Выбираю месяц: {target_month_name}")
-        await page.locator(month_selector).click(timeout=10000)
+        
+        # Умный выбор месяца
+        month_selectors = [
+            'div[aria-label="місяць"]',
+            'select[aria-label="місяць"]',
+            'div[placeholder*="місяць"]',
+            'select[name*="month"]',
+            'div[id*="month"]'
+        ]
+        
+        if not await smart_click_element(page, month_selectors, "поле месяца"):
+            raise Exception("Не удалось найти поле месяца рождения")
+            
         await page.wait_for_timeout(500)
         await page.get_by_role("option", name=target_month_name).click(timeout=10000)
+        
+        # Умный выбор пола
         if selected_gender == 'male':
-            await page.locator(male_radio_selector).click(timeout=10000)
+            gender_selectors = [
+                'input[type="radio"][value=""][id^="gender-Ч"]',
+                'input[type="radio"][id*="male"]',
+                'input[type="radio"][value="male"]',
+                'input[name*="gender"][value*="Ч"]'
+            ]
+            if not await smart_click_element(page, gender_selectors, "мужской пол"):
+                raise Exception("Не удалось выбрать мужской пол")
         else:
-            await page.locator(female_radio_selector).click(timeout=10000)
+            gender_selectors = [
+                'input[type="radio"][value=""][id^="gender-Ж"]',
+                'input[type="radio"][id*="female"]',
+                'input[type="radio"][value="female"]',
+                'input[name*="gender"][value*="Ж"]'
+            ]
+            if not await smart_click_element(page, gender_selectors, "женский пол"):
+                raise Exception("Не удалось выбрать женский пол")
         print_timestamped("Данные заявителя успешно введены.")
         await page.locator(next_button_selector).wait_for(state='visible', timeout=10000)
         async with page.expect_navigation(timeout=CONFIG['timeout']):
@@ -1676,6 +1817,12 @@ async def check_session_validity(page):
         except PlaywrightTimeoutError:
             # Если элемента нет за 2 секунды - это хорошо, сессия не закончилась.
             pass
+        except Exception as e:
+            # Обработка случаев, когда страница/браузер закрыты
+            if "closed" in str(e).lower() or "target" in str(e).lower():
+                print_timestamped(f"Страница или браузер закрыты при проверке сессии: {e}")
+                return False
+            raise e
 
         logged_in_element_selector = '#main-container > div > div > header > div.jss44 > div > div.jss38 > a'
         await page.locator(logged_in_element_selector).wait_for(state='visible', timeout=5000)
@@ -1685,6 +1832,9 @@ async def check_session_validity(page):
         print_timestamped("Авторизованный элемент не найден или таймаут. Сессия неактивна.")
         return False
     except Exception as e:
+        if "closed" in str(e).lower() or "target" in str(e).lower():
+            print_timestamped(f"Страница или браузер закрыты при проверке сессии: {e}")
+            return False
         print_timestamped(f"Ошибка при проверке валидности сессии: {e}")
         return False
 
@@ -1744,7 +1894,7 @@ async def try_access(browser, page):
 
 
 async def main():
-    global VERBOSE_TELEGRAM_NOTIFICATIONS, USER_DATA
+    global VERBOSE_TELEGRAM_NOTIFICATIONS, USER_DATA, CONSECUTIVE_ERRORS, LAST_ERROR_TYPE
 
     parser = argparse.ArgumentParser(description="Автоматизация консульских услуг.")
     parser.add_argument('--verbose-telegram', action='store_true', help="Включает подробные текстовые уведомления в Telegram.")
@@ -1809,13 +1959,16 @@ async def main():
             if result and "Успешное автоматическое бронирование" in result:
                 print_timestamped(f"\nУСПЕХ: {result}")
                 await send_telegram_message(f"АВТОМАТИЗАЦИЯ УСПЕШНО ЗАВЕРШЕНА: {result}", is_verbose=False)
+                CONSECUTIVE_ERRORS = 0  # Сбрасываем счетчик при успехе
                 break
             elif result and "Booking failed. Entering manual mode" in result:
                  print_timestamped(f"\nАВТО-БРОНИРОВАНИЕ НЕ УДАЛОСЬ: {result}")
                  await manual_mode(page, f"Авто-бронирование не удалось. Причина: {result}", browser_instance=browser)
+                 CONSECUTIVE_ERRORS = 0  # Сбрасываем счетчик при переходе в ручной режим
                  break
             elif result:
                 print_timestamped(f"\nУСПЕХ (но не бронирование): {result}")
+                CONSECUTIVE_ERRORS = 0  # Сбрасываем счетчик при любом успехе
                 if args.manual_mode:
                     await manual_mode(page, "Автоматизация успешно завершена.", browser_instance=browser)
                 break
@@ -1823,25 +1976,96 @@ async def main():
         except SessionResetException as e:
             print_timestamped(f"ШТАТНАЯ СИТУАЦИЯ: {e}. Перезапуск через 15 секунд.")
             await send_telegram_message(f"Сессия сброшена. Перезапуск через 15 секунд.", is_verbose=True)
+            CONSECUTIVE_ERRORS = 0  # Сброс сессии не считается критической ошибкой
             await asyncio.sleep(15)
 
         except Exception as e:
-            print_timestamped(f"ФАТАЛЬНАЯ ОШИБКА: {e}. Перезапуск через 60 секунд.")
-            await send_telegram_message(f"ФАТАЛЬНАЯ ОШИБКА: {e}. Перезапуск через 60 секунд.", is_verbose=False)
-            await asyncio.sleep(60)
+            CONSECUTIVE_ERRORS += 1
+            error_type = type(e).__name__
+            error_message = str(e)
+            
+            print_timestamped(f"ОШИБКА #{CONSECUTIVE_ERRORS}: {error_type} - {error_message}")
+            
+            # Проверяем, является ли это ошибкой поиска элемента
+            is_element_error = any(keyword in error_message.lower() for keyword in [
+                'не удалось найти', 'timeout', 'element not found', 'selector', 'локатор'
+            ])
+            
+            if is_element_error:
+                await send_telegram_message(f"❌ Ошибка поиска элемента #{CONSECUTIVE_ERRORS}: {error_message[:200]}", is_verbose=False)
+            else:
+                await send_telegram_message(f"❌ ОШИБКА #{CONSECUTIVE_ERRORS}: {error_type} - {error_message[:200]}", is_verbose=False)
+            
+            # Если слишком много ошибок подряд, предлагаем ручной режим
+            if CONSECUTIVE_ERRORS >= CONFIG['max_consecutive_errors']:
+                await send_telegram_message(f"🚨 КРИТИЧНО: {CONSECUTIVE_ERRORS} ошибок подряд. Переход в ручной режим...", is_verbose=False)
+                
+                if page and not page.is_closed():
+                    # Делаем скриншот для диагностики
+                    screenshot_path = await save_screenshot(page, f"critical_error_{CONSECUTIVE_ERRORS}")
+                    if screenshot_path:
+                        await send_telegram_photo(screenshot_path, f"Критическая ошибка #{CONSECUTIVE_ERRORS}")
+                    
+                    # Переходим в ручной режим
+                    manual_result = await manual_mode(page, f"Критическая ошибка после {CONSECUTIVE_ERRORS} попыток: {error_message}", browser_instance=browser)
+                    if manual_result:
+                        break
+                
+                CONSECUTIVE_ERRORS = 0  # Сбрасываем счетчик после ручного режима
+            
+            # Увеличиваем время ожидания при повторных ошибках
+            sleep_time = min(60 + (CONSECUTIVE_ERRORS - 1) * 30, 300)  # От 60 до 300 секунд
+            print_timestamped(f"Перезапуск через {sleep_time} секунд...")
+            await asyncio.sleep(sleep_time)
 
         finally:
             if not (result and "Booking failed" in result):
-                if context:
-                    await context.close()
-                if browser and browser.is_connected():
-                    await browser.close()
-                if playwright_instance:
-                    await playwright_instance.stop()
+                try:
+                    if context:
+                        await context.close()
+                except Exception as e:
+                    print_timestamped(f"Ошибка при закрытии контекста: {e}")
+                
+                try:
+                    if browser and browser.is_connected():
+                        await browser.close()
+                except Exception as e:
+                    print_timestamped(f"Ошибка при закрытии браузера: {e}")
+                
+                try:
+                    if playwright_instance:
+                        await playwright_instance.stop()
+                except Exception as e:
+                    print_timestamped(f"Ошибка при остановке Playwright: {e}")
             print_timestamped("="*20 + " КОНЕЦ ПОПЫТКИ " + "="*20 + "\n")
 
 if __name__ == "__main__":
+    import signal
+    import sys
+    
+    def signal_handler(sig, frame):
+        print_timestamped("\nПрограмма прервана пользователем.")
+        # Дадим время завершиться фоновым задачам
+        asyncio.get_event_loop().stop()
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         print_timestamped("\nПрограмма прервана пользователем.")
+    except Exception as e:
+        print_timestamped(f"\nНеобработанная ошибка: {e}")
+    finally:
+        # Отменяем все оставшиеся задачи
+        try:
+            loop = asyncio.get_event_loop()
+            if not loop.is_closed():
+                pending = asyncio.all_tasks(loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        except Exception as cleanup_error:
+            print_timestamped(f"Ошибка при очистке задач: {cleanup_error}")
