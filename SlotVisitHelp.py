@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+
 # --- Класс для специального исключения при сбросе сессии ---
 class SessionResetException(Exception):
     """Исключение, вызываемое при сбросе сессии на сайте."""
